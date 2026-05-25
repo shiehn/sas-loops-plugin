@@ -1,8 +1,8 @@
 /**
- * @signalsandsorcery/sample-player — Built-in Sample Player Plugin
+ * @signalsandsorcery/loops — Built-in Loops Plugin
  *
- * Provides sample library browsing, import, time-stretching,
- * and scene-scoped sample track management.
+ * Provides browsing, importing, and playing audio loops/samples with
+ * time-stretching and scene-scoped track management.
  */
 
 import type { ComponentType } from 'react';
@@ -13,13 +13,13 @@ import type {
   PluginSettingsSchema,
   MusicalContext,
 } from '@signalsandsorcery/plugin-sdk';
-import { SamplePlayerPanel } from './SamplePlayerPanel';
+import { LoopsPanel } from './LoopsPanel';
 
-export class SamplePlayerPlugin implements GeneratorPlugin {
-  readonly id = '@signalsandsorcery/sample-player';
-  readonly displayName = 'Samples';
+export class LoopsPlugin implements GeneratorPlugin {
+  readonly id = '@signalsandsorcery/loops';
+  readonly displayName = 'Loops';
   readonly version = '1.0.0';
-  readonly description = 'Sample library browser with time-stretching and scene-scoped playback';
+  readonly description = 'Audio loop / sample library browser with time-stretching and scene-scoped playback';
   readonly generatorType = 'sample' as const;
   readonly minHostVersion = '1.0.0';
 
@@ -27,16 +27,16 @@ export class SamplePlayerPlugin implements GeneratorPlugin {
 
   async activate(host: PluginHost): Promise<void> {
     this.host = host;
-    console.log('[SamplePlayerPlugin] Activated');
+    console.log('[LoopsPlugin] Activated');
   }
 
   async deactivate(): Promise<void> {
     this.host = null;
-    console.log('[SamplePlayerPlugin] Deactivated');
+    console.log('[LoopsPlugin] Deactivated');
   }
 
   getUIComponent(): ComponentType<PluginUIProps> {
-    return SamplePlayerPanel;
+    return LoopsPanel;
   }
 
   getSettingsSchema(): PluginSettingsSchema | null {
@@ -52,4 +52,4 @@ export class SamplePlayerPlugin implements GeneratorPlugin {
   }
 }
 
-export default SamplePlayerPlugin;
+export default LoopsPlugin;

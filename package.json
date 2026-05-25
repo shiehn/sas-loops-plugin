@@ -1,7 +1,7 @@
 {
-  "name": "@signalsandsorcery/sample-player",
+  "name": "@signalsandsorcery/loops",
   "version": "1.0.0",
-  "description": "Sample library browser with time-stretching and scene-scoped playback",
+  "description": "Audio loop / sample library browser with time-stretching and scene-scoped playback",
   "main": "dist/index.js",
   "scripts": {
     "build": "tsup",

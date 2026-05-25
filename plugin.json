@@ -1,8 +1,8 @@
 {
-  "id": "@signalsandsorcery/sample-player",
-  "displayName": "Samples",
+  "id": "@signalsandsorcery/loops",
+  "displayName": "Loops",
   "version": "1.0.0",
-  "description": "Sample library browser with time-stretching and scene-scoped playback",
+  "description": "Audio loop / sample library browser with time-stretching and scene-scoped playback",
   "generatorType": "sample",
   "main": "index.js",
   "author": "Signals & Sorcery",

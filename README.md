@@ -1,6 +1,6 @@
-# Sample Player Plugin
+# Loops Plugin
 
-A [Signals & Sorcery](https://signalsandsorcery.com) plugin for browsing, importing, and playing audio samples with time-stretching.
+A [Signals & Sorcery](https://signalsandsorcery.com) plugin for browsing, importing, and playing audio loops and samples with time-stretching.
 
 <p align="center">
   <img src="assets/signals-and-sorcery.png" alt="Signals & Sorcery" width="420" />
@@ -10,9 +10,9 @@ A [Signals & Sorcery](https://signalsandsorcery.com) plugin for browsing, import
 
 ## What it does
 
-- Browse and search the sample library by category, BPM, key, and tags
+- Browse and search the loop / sample library by category, BPM, key, and tags
 - Import audio files (WAV, MP3, FLAC, OGG, AIFF) into the library
-- Create sample tracks scoped to the active scene
+- Create scene-scoped loop tracks
 - Time-stretch samples to match project BPM
 - Per-track volume, pan, mute, and solo controls
 
@@ -21,16 +21,16 @@ A [Signals & Sorcery](https://signalsandsorcery.com) plugin for browsing, import
 From within Signals & Sorcery: **Settings > Manage Plugins > Add Plugin** and enter:
 
 ```
-https://github.com/shiehn/sas-sample-plugin
+https://github.com/shiehn/sas-loops-plugin
 ```
 
-Or clone manually into `~/.signals-and-sorcery/plugins/@signalsandsorcery/sample-player/`.
+Or clone manually into `~/.signals-and-sorcery/plugins/@signalsandsorcery/loops/`.
 
 ## Capabilities
 
 | Capability | Required |
 |------------|----------|
-| `fileDialog` | Yes - file import dialog |
+| `fileDialog` | Yes — file import dialog |
 
 ## Development
 
@@ -41,7 +41,7 @@ Built with the [@signalsandsorcery/plugin-sdk](https://github.com/shiehn/sas-plu
 - **[Signals & Sorcery](https://signalsandsorcery.com)** — the flagship AI music production workstation
 - **[sas-plugin-sdk](https://github.com/shiehn/sas-plugin-sdk)** — TypeScript SDK for building generator plugins
 - **[sas-synth-plugin](https://github.com/shiehn/sas-synth-plugin)** — AI MIDI generation with Surge XT
-- **[sas-audio-plugin](https://github.com/shiehn/sas-audio-plugin)** — AI audio texture generation
+- **[sas-stems-plugin](https://github.com/shiehn/sas-stems-plugin)** — AI audio stems from text prompts
 - **[DeclarAgent](https://github.com/shiehn/DeclarAgent)** — Declarative agent + MCP transport for S&S
 
 <p align="center">

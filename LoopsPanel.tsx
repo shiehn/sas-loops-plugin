@@ -1,7 +1,7 @@
 /**
- * SamplePlayerPanel — UI for the @signalsandsorcery/sample-player plugin
+ * LoopsPanel — UI for the @signalsandsorcery/loops plugin
  *
- * Renders the sample track list with browse/import controls,
+ * Renders the sample / loop track list with browse/import controls,
  * volume slider, mute/solo, and delete. Uses ONLY PluginHost
  * methods — no EngineContext, no window.electronAPI.
  */
@@ -42,10 +42,10 @@ interface SampleTrackState {
 }
 
 // ============================================================================
-// SamplePlayerPanel
+// LoopsPanel
 // ============================================================================
 
-export function SamplePlayerPanel({
+export function LoopsPanel({
   host,
   activeSceneId,
   isConnected,
@@ -117,7 +117,7 @@ export function SamplePlayerPanel({
       }
       setTracks(trackStates);
     } catch (error: unknown) {
-      console.error('[SamplePlayerPanel] Failed to load tracks:', error);
+      console.error('[LoopsPanel] Failed to load tracks:', error);
     } finally {
       setIsLoadingTracks(false);
     }
@@ -165,7 +165,7 @@ export function SamplePlayerPanel({
       const result: PluginSampleInfo[] = await host.getSamples();
       setSamples(result);
     } catch (error: unknown) {
-      console.error('[SamplePlayerPanel] Failed to load samples:', error);
+      console.error('[LoopsPanel] Failed to load samples:', error);
       setSamples([]);
     } finally {
       setIsLoadingSamples(false);
@@ -681,4 +681,4 @@ function pluginFxToToggleFx(sdkState: PluginTrackFxDetailState): TrackFxDetailSt
   return result;
 }
 
-export default SamplePlayerPanel;
+export default LoopsPanel;
