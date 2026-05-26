@@ -1,8 +1,11 @@
 /**
- * @signalsandsorcery/loops — Built-in Loops Plugin
+ * @signalsandsorcery/loops — Loops Plugin
  *
- * Provides browsing, importing, and playing audio loops/samples with
- * time-stretching and scene-scoped track management.
+ * Provides loop / sample library browsing, import, time-stretching, and
+ * scene-scoped sample track management.
+ *
+ * Extracted from the in-tree built-in (W9). The host consumes this package via
+ * `file:../sas-loops-plugin` and imports the class + manifest from the root.
  */
 
 import type { ComponentType } from 'react';
@@ -14,6 +17,10 @@ import type {
   MusicalContext,
 } from '@signalsandsorcery/plugin-sdk';
 import { LoopsPanel } from './LoopsPanel';
+import loopsManifest from './plugin.json';
+
+/** Plugin manifest (re-exported so the host registers it from the package root). */
+export { loopsManifest };
 
 export class LoopsPlugin implements GeneratorPlugin {
   readonly id = '@signalsandsorcery/loops';
