@@ -25,7 +25,7 @@ import type {
   FxCategory,
   TrackFxDetailState,
 } from '@signalsandsorcery/plugin-sdk';
-import { TrackRow, EMPTY_FX_DETAIL_STATE } from '@signalsandsorcery/plugin-sdk';
+import { TrackRow, EMPTY_FX_DETAIL_STATE, ImportTrackModal } from '@signalsandsorcery/plugin-sdk';
 
 // The factory loop/sample library ships as the `sas-loop-library` pack. The
 // plugin only needs the packId — the HOST owns the download + the post-extract
@@ -72,6 +72,7 @@ export function LoopsPanel({
   const [tracks, setTracks] = useState<SampleTrackState[]>([]);
   const [isLoadingTracks, setIsLoadingTracks] = useState(false);
   const [pickerOpen, setPickerOpen] = useState(false);
+  const [importOpen, setImportOpen] = useState(false);
   const [samples, setSamples] = useState<PluginSampleInfo[]>([]);
   const [searchQuery, setSearchQuery] = useState('');
   const [isLoadingSamples, setIsLoadingSamples] = useState(false);
@@ -144,6 +145,12 @@ export function LoopsPanel({
     if (!sceneAtStart) {
       setTracks([]);
       tracksLoadedForSceneRef.current = null;
+      // No scene → not loading. Without this, a load that already set
+      // isLoadingTracks=true and is then superseded by a flip to a null
+      // activeSceneId (the platform's effectiveSceneId briefly returns null
+      // while project.scenes repopulates during load) leaves the spinner
+      // stuck on "Loading tracks..." forever.
+      setIsLoadingTracks(false);
       return;
     }
 
@@ -467,6 +474,24 @@ export function LoopsPanel({
     const disabled = needsContract || !isConnected || !activeSceneId || tracks.length >= MAX_TRACKS;
     onHeaderContent(
       <div className="flex gap-1">
+        {host.listImportableTracks && (
+          <button
+            data-testid="import-from-scene-loops-button"
+            onClick={(e: React.MouseEvent) => {
+              e.stopPropagation();
+              onExpandSelf?.();
+              setImportOpen(true);
+            }}
+            disabled={!activeSceneId || needsContract}
+            className={`px-2 py-0.5 text-[10px] font-medium rounded-sm border transition-colors ${
+              !activeSceneId || needsContract
+                ? 'bg-sas-panel border-sas-border text-sas-muted/50 cursor-not-allowed'
+                : 'bg-sas-panel-alt border-sas-border text-sas-muted hover:border-sas-accent hover:text-sas-accent'
+            }`}
+          >
+            Import
+          </button>
+        )}
         <button
           data-testid="import-sample-button"
           onClick={(e: React.MouseEvent) => {
@@ -480,7 +505,7 @@ export function LoopsPanel({
               : 'bg-sas-panel-alt border-sas-border text-sas-muted hover:border-sas-accent hover:text-sas-accent'
           }`}
         >
-          Import
+          Load
         </button>
         <button
           data-testid="add-sample-button"
@@ -507,7 +532,7 @@ export function LoopsPanel({
       </div>
     );
     return () => { onHeaderContent(null); };
-  }, [onHeaderContent, isConnected, activeSceneId, tracks.length, pickerOpen, openPicker, closePicker, handleImport, needsContract, onOpenContract, onExpandSelf]);
+  }, [onHeaderContent, isConnected, activeSceneId, tracks.length, pickerOpen, openPicker, closePicker, handleImport, needsContract, onOpenContract, host]);
 
   // ─── Push loading state to accordion header ────────────────────────
   useEffect(() => {
@@ -746,6 +771,16 @@ export function LoopsPanel({
 
   return (
     <div data-testid="sample-section" className="p-2 space-y-2">
+      {host.listImportableTracks && (
+        <ImportTrackModal
+          host={host}
+          open={importOpen}
+          onClose={() => setImportOpen(false)}
+          onImported={() => { void loadTracks(); }}
+          testIdPrefix="loops-import"
+        />
+      )}
+
       {/* Factory sample library download prompt — only when library is empty */}
       {showFactoryDownloadPrompt && (
         <div
