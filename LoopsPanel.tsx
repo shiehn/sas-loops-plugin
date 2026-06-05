@@ -25,7 +25,7 @@ import type {
   FxCategory,
   TrackFxDetailState,
 } from '@signalsandsorcery/plugin-sdk';
-import { TrackRow, EMPTY_FX_DETAIL_STATE, ImportTrackModal } from '@signalsandsorcery/plugin-sdk';
+import { TrackRow, type DrawerTab, EMPTY_FX_DETAIL_STATE, ImportTrackModal } from '@signalsandsorcery/plugin-sdk';
 
 // The factory loop/sample library ships as the `sas-loop-library` pack. The
 // plugin only needs the packId — the HOST owns the download + the post-extract
@@ -51,7 +51,10 @@ interface SampleTrackState {
   sample: PluginSampleInfo;
   runtimeState: PluginTrackRuntimeState;
   fxDetailState: TrackFxDetailState;
-  fxDrawerOpen: boolean;
+  // Unified drawer state. Loops support only the FX tab, so the strip is hidden
+  // and the drawer renders FX directly (drawerTab is always 'fx').
+  drawerOpen: boolean;
+  drawerTab: DrawerTab;
 }
 
 // ============================================================================
@@ -207,7 +210,8 @@ export function LoopsPanel({
           sample: st.sample,
           runtimeState,
           fxDetailState,
-          fxDrawerOpen: false,
+          drawerOpen: false,
+          drawerTab: 'fx',
         });
       }
       if (isStale()) return;
@@ -423,7 +427,8 @@ export function LoopsPanel({
           pan: 0,
         },
         fxDetailState: { ...EMPTY_FX_DETAIL_STATE },
-        fxDrawerOpen: false,
+        drawerOpen: false,
+        drawerTab: 'fx',
       };
       setTracks((prev: SampleTrackState[]) => [...prev, newTrack]);
       closePicker();
@@ -669,12 +674,15 @@ export function LoopsPanel({
   }, [host]);
 
   const toggleFxDrawer = useCallback((trackId: string): void => {
-    setTracks((prev: SampleTrackState[]) => prev.map((t: SampleTrackState) =>
-      t.handle.id === trackId ? { ...t, fxDrawerOpen: !t.fxDrawerOpen } : t
-    ));
-    // Refresh FX state when opening drawer
+    setTracks((prev: SampleTrackState[]) => prev.map((t: SampleTrackState) => {
+      if (t.handle.id !== trackId) return t;
+      const onFx = t.drawerOpen && t.drawerTab === 'fx';
+      return { ...t, drawerOpen: !onFx, drawerTab: 'fx' };
+    }));
+    // Refresh FX state when opening the FX tab
     const track = tracks.find((t: SampleTrackState) => t.handle.id === trackId);
-    if (track && !track.fxDrawerOpen) {
+    const wasOnFx = !!track && track.drawerOpen && track.drawerTab === 'fx';
+    if (track && !wasOnFx) {
       host.getTrackFxState(trackId).then((fxState: PluginTrackFxDetailState) => {
         setTracks((prev: SampleTrackState[]) => prev.map((t: SampleTrackState) =>
           t.handle.id === trackId ? { ...t, fxDetailState: pluginFxToToggleFx(fxState) } : t
@@ -972,7 +980,8 @@ export function LoopsPanel({
               pan: track.runtimeState.pan,
             }}
             fxDetailState={track.fxDetailState}
-            fxDrawerOpen={track.fxDrawerOpen}
+            drawerOpen={track.drawerOpen}
+            drawerTab={track.drawerTab}
             onDelete={() => handleDeleteTrack(track.handle.id)}
             onMuteToggle={() => handleMuteToggle(track.handle.id)}
             onSoloToggle={() => handleSoloToggle(track.handle.id)}
