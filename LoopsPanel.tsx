@@ -25,7 +25,7 @@ import type {
   FxCategory,
   TrackFxDetailState,
 } from '@signalsandsorcery/plugin-sdk';
-import { TrackRow, type DrawerTab, EMPTY_FX_DETAIL_STATE, ImportTrackModal } from '@signalsandsorcery/plugin-sdk';
+import { TrackRow, type DrawerTab, useAnySolo, EMPTY_FX_DETAIL_STATE, ImportTrackModal } from '@signalsandsorcery/plugin-sdk';
 
 // The factory loop/sample library ships as the `sas-loop-library` pack. The
 // plugin only needs the packId — the HOST owns the download + the post-extract
@@ -73,6 +73,8 @@ export function LoopsPanel({
   onExpandSelf,
 }: PluginUIProps): React.ReactElement {
   const [tracks, setTracks] = useState<SampleTrackState[]>([]);
+  // Cross-panel: dim non-soloed rows when ANY track (any panel) is soloed.
+  const anySolo = useAnySolo(host);
   const [isLoadingTracks, setIsLoadingTracks] = useState(false);
   const [pickerOpen, setPickerOpen] = useState(false);
   const [importOpen, setImportOpen] = useState(false);
@@ -979,6 +981,7 @@ export function LoopsPanel({
               volume: track.runtimeState.volume,
               pan: track.runtimeState.pan,
             }}
+            soloedOut={anySolo && !track.runtimeState.solo}
             fxDetailState={track.fxDetailState}
             drawerOpen={track.drawerOpen}
             drawerTab={track.drawerTab}
