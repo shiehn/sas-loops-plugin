@@ -25,7 +25,7 @@ import type {
   FxCategory,
   TrackFxDetailState,
 } from '@signalsandsorcery/plugin-sdk';
-import { TrackRow, type DrawerTab, useAnySolo, EMPTY_FX_DETAIL_STATE, ImportTrackModal } from '@signalsandsorcery/plugin-sdk';
+import { TrackRow, type DrawerTab, useAnySolo, EMPTY_FX_DETAIL_STATE, ImportTrackModal, useTrackLevels } from '@signalsandsorcery/plugin-sdk';
 
 // The factory loop/sample library ships as the `sas-loop-library` pack. The
 // plugin only needs the packId — the HOST owns the download + the post-extract
@@ -72,6 +72,14 @@ export function LoopsPanel({
   onOpenContract,
   onExpandSelf,
 }: PluginUIProps): React.ReactElement {
+  // Cosmetic per-track peak meters. Poll while the panel is mounted + visible;
+  // NOT gated on transport state (this app plays via decks/clip-launcher, so the
+  // linear "is playing" flag is unreliable). Stopped tracks just read the floor.
+  // The host coalesces the read so playback always wins over the GUI. Older
+  // hosts (no getTrackLevels) degrade to no meter via the `supportsMeters` guard.
+  const supportsMeters = typeof host.getTrackLevels === 'function';
+  const trackLevels = useTrackLevels(host);
+
   const [tracks, setTracks] = useState<SampleTrackState[]>([]);
   // Cross-panel: dim non-soloed rows when ANY track (any panel) is soloed.
   const anySolo = useAnySolo(host);
@@ -975,6 +983,7 @@ export function LoopsPanel({
           <TrackRow
             key={track.handle.id}
             track={{ id: track.handle.id, name: track.handle.name }}
+            levels={supportsMeters ? trackLevels : undefined}
             runtimeState={{
               muted: track.runtimeState.muted,
               solo: track.runtimeState.solo,
