@@ -883,6 +883,56 @@ export function LoopsPanel({
     [host, activeSceneId, isConnected, tracks.length, sceneContext, placeLoop, applyFadeAutomation, loadTracks],
   );
 
+  // Audio-only one-sided transition (stutter / chopped / delay). Stutter & chopped
+  // RENDER a new WAV (renderSampleEffect); delay places the loop + a delay-throw FX.
+  // All three ramp the loop in/out across the transition.
+  const handleCreateAudioTransition = useCallback(
+    async (selection: FadeSelection, direction: FadeDirection, effect: 'stutter' | 'chopped' | 'delay'): Promise<void> => {
+      const scene = activeSceneId;
+      const fromSceneId = sceneContext?.transitionFromSceneId ?? '';
+      const toSceneId = sceneContext?.transitionToSceneId ?? '';
+      if (!scene) throw new Error('No active scene.');
+      if (!isConnected) throw new Error('Systems not connected.');
+      if (tracks.length + 1 > MAX_TRACKS) throw new Error('Not enough track slots.');
+      if (!host.getSampleTrackInfo) throw new Error('Audio transitions are unavailable on this host.');
+      const sourceSceneId = direction === 'out' ? fromSceneId : toSceneId;
+      const created: PluginTrackHandle[] = [];
+      try {
+        const mc = await host.getMusicalContext();
+        const info = await host.getSampleTrackInfo(selection.dbId);
+        if (!info) throw new Error('Loop is no longer available.');
+        let sampleId = info.sampleId;
+        // Stutter / chopped re-render the loop's audio offline into a new sample.
+        if (effect === 'stutter' || effect === 'chopped') {
+          if (!host.renderSampleEffect) throw new Error(`${effect} requires a newer host build.`);
+          const rendered = await host.renderSampleEffect(sampleId, { effect, bars: mc.bars, bpm: mc.bpm });
+          sampleId = rendered.id;
+        }
+        try { sampleId = (await host.fitSampleToScene(sampleId)).id; } catch { /* fit best-effort */ }
+        const handle = await host.createSampleTrack(sampleId);
+        created.push(handle);
+        await applyFadeAutomation(handle.id, direction, mc.bars, mc.bpm, 0.5, 'volume');
+        appliedFadeAutomationRef.current.add(handle.id);
+        // Delay → add a delay-throw FX preset on top of the fade.
+        if (effect === 'delay' && host.setTrackFxPreset) {
+          try { await host.setTrackFxPreset(handle.id, 'delay' as FxCategory, 0); } catch { /* fx best-effort */ }
+        }
+        const meta: FadeMeta = {
+          direction, gesture: 'volume', effect,
+          sourceTrackDbId: selection.dbId, sourceSceneId,
+          sourceName: selection.name, soundLabel: info.fileName ?? handle.name, sliderPos: 0.5,
+        };
+        await host.setSceneData(scene, `track:${handle.dbId}:fade`, meta);
+        await loadTracks();
+        host.showToast('success', `${effect} ${direction === 'out' ? 'out' : 'in'} created`, selection.name);
+      } catch (err: unknown) {
+        for (const h of [...created].reverse()) { try { await host.deleteSampleTrack(h.id); } catch { /* best effort */ } }
+        throw err instanceof Error ? err : new Error(String(err));
+      }
+    },
+    [host, activeSceneId, isConnected, tracks.length, sceneContext, applyFadeAutomation, loadTracks],
+  );
+
   // Resolve committed pairs/fades against live tracks (only complete pairs group).
   const { resolvedCrossfadePairs, crossfadeMemberDbIds } = useMemo(() => {
     const byDbId = new Map(tracks.map((t) => [t.handle.dbId, t]));
@@ -1235,6 +1285,7 @@ export function LoopsPanel({
             excludeSourceDbIds={excludeSourceDbIds}
             onCreateCrossfade={handleCreateCrossfade}
             onCreateFade={handleCreateFade}
+            onCreateAudioTransition={handleCreateAudioTransition}
             familyLabel="Loops"
             testIdPrefix="loops-transition-designer"
           />
@@ -1294,6 +1345,7 @@ export function LoopsPanel({
               levels={supportsMeters ? trackLevels : undefined}
               direction={fade.meta.direction}
               gesture={fade.meta.gesture}
+              effect={fade.meta.effect}
               sliderPos={fade.meta.sliderPos}
               layer={{
                 trackId: fade.track.handle.id,
