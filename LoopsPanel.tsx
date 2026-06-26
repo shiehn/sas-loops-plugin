@@ -12,7 +12,7 @@
  * window.electronAPI, no shared/constants import (W9 — no back doors).
  */
 
-import React, { useState, useEffect, useCallback, useRef } from 'react';
+import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { GiSoundWaves } from 'react-icons/gi';
 import type {
   PluginUIProps,
@@ -25,7 +25,7 @@ import type {
   FxCategory,
   TrackFxDetailState,
 } from '@signalsandsorcery/plugin-sdk';
-import { TrackRow, type DrawerTab, useAnySolo, EMPTY_FX_DETAIL_STATE, ImportTrackModal, useTrackLevels } from '@signalsandsorcery/plugin-sdk';
+import { TrackRow, type DrawerTab, useAnySolo, EMPTY_FX_DETAIL_STATE, ImportTrackModal, useTrackLevels, TransitionDesigner, CrossfadeTrackRow, FadeTrackRow, parseCrossfadePairs, parseFades, buildCrossfadeVolumeCurves, buildFadeVolumeCurve, type CrossfadeSlot, type CrossfadeSelection, type CrossfadeMeta, type CrossfadePairMeta, type FadeDirection, type FadeGesture, type FadeMeta, type FadeEntry, type FadeSelection } from '@signalsandsorcery/plugin-sdk';
 
 // The factory loop/sample library ships as the `sas-loop-library` pack. The
 // plugin only needs the packId — the HOST owns the download + the post-extract
@@ -55,6 +55,16 @@ interface SampleTrackState {
   // and the drawer renders FX directly (drawerTab is always 'fx').
   drawerOpen: boolean;
   drawerTab: DrawerTab;
+}
+
+/** A committed crossfade pair resolved against live sample tracks. */
+interface ResolvedCrossfadePair extends CrossfadePairMeta {
+  origin: SampleTrackState;
+  target: SampleTrackState;
+}
+/** A committed fade resolved against its live sample track. */
+interface ResolvedFade extends FadeEntry {
+  track: SampleTrackState;
 }
 
 // ============================================================================
@@ -100,6 +110,35 @@ export function LoopsPanel({
   type FactoryDownloadStatus = 'idle' | 'downloading' | 'extracting' | 'importing' | 'error';
   const [factoryDownloadStatus, setFactoryDownloadStatus] = useState<FactoryDownloadStatus>('idle');
   const [factoryDownloadProgress, setFactoryDownloadProgress] = useState(0);
+
+  // ─── Transition Designer (audio crossfade / fade in transition scenes) ───
+  const [designerView, setDesignerView] = useState(false);
+  const [transitionSourceTotal, setTransitionSourceTotal] = useState(0);
+  const [crossfadePairsMeta, setCrossfadePairsMeta] = useState<CrossfadePairMeta[]>([]);
+  const [fadesMeta, setFadesMeta] = useState<FadeEntry[]>([]);
+  // Engine track ids whose fade curve was applied this session (re-applied on load;
+  // the curve is NOT engine-persisted — recomputed from sliderPos/gesture).
+  const appliedFadeAutomationRef = useRef<Set<string>>(new Set());
+  const xfFromId = sceneContext?.transitionFromSceneId ?? null;
+  const xfToId = sceneContext?.transitionToSceneId ?? null;
+  const canCrossfade =
+    sceneContext?.sceneType === 'transition' && !!xfFromId && !!xfToId && !!host.listSceneFamilyTracks;
+  // Leaving a transition scene drops back to the Tracks view (the toggle is hidden).
+  useEffect(() => { if (!canCrossfade) setDesignerView(false); }, [canCrossfade]);
+  // Fetch the source-track total once per transition scene (stable denominator).
+  useEffect(() => {
+    if (!canCrossfade || !xfFromId || !xfToId || !host.listSceneFamilyTracks) {
+      setTransitionSourceTotal(0);
+      return;
+    }
+    let cancelled = false;
+    void Promise.all([host.listSceneFamilyTracks(xfFromId), host.listSceneFamilyTracks(xfToId)])
+      .then(([a, b]) => { if (!cancelled) setTransitionSourceTotal(a.length + b.length); })
+      .catch(() => { if (!cancelled) setTransitionSourceTotal(0); });
+    return () => { cancelled = true; };
+  }, [canCrossfade, xfFromId, xfToId, host]);
+  // Loops already turned into transitions: 2 sources per crossfade pair, 1 per fade.
+  const transitionDone = crossfadePairsMeta.length * 2 + fadesMeta.length;
 
   // ─── Sample preview (one-shot audition through cue output) ───────
   // Reuses the dedicated preview SimpleLoopPlayer instance via the
@@ -226,6 +265,16 @@ export function LoopsPanel({
       }
       if (isStale()) return;
       setTracks(trackStates);
+      // Parse committed crossfade/fade metadata for the Transition Designer.
+      if (host.getAllSceneData) {
+        try {
+          const sceneData = (await host.getAllSceneData(sceneAtStart)) as Record<string, unknown>;
+          if (!isStale()) {
+            setCrossfadePairsMeta(parseCrossfadePairs(sceneData));
+            setFadesMeta(parseFades(sceneData));
+          }
+        } catch { /* best effort — transition meta is optional */ }
+      }
     } catch (error: unknown) {
       console.error('[LoopsPanel] Failed to load tracks:', error);
     } finally {
@@ -488,8 +537,8 @@ export function LoopsPanel({
     if (!onHeaderContent) return;
     const disabled = needsContract || !isConnected || !activeSceneId || tracks.length >= MAX_TRACKS;
     onHeaderContent(
-      <div className="flex gap-1">
-        {host.listImportableTracks && (
+      <div className="flex gap-1 items-center">
+        {(!canCrossfade || !designerView) && host.listImportableTracks && (
           <button
             data-testid="import-from-scene-loops-button"
             onClick={(e: React.MouseEvent) => {
@@ -507,47 +556,79 @@ export function LoopsPanel({
             Import
           </button>
         )}
-        <button
-          data-testid="import-sample-button"
-          onClick={(e: React.MouseEvent) => {
-            e.stopPropagation();
-            if (needsContract) { onOpenContract?.(); return; }
-            handleImport();
-          }}
-          className={`px-2 py-0.5 text-[10px] font-medium rounded-sm border transition-colors ${
-            needsContract || !isConnected
-              ? 'bg-sas-panel border-sas-border text-sas-muted/50 cursor-not-allowed'
-              : 'bg-sas-panel-alt border-sas-border text-sas-muted hover:border-sas-accent hover:text-sas-accent'
-          }`}
-        >
-          Load
-        </button>
-        <button
-          data-testid="add-sample-button"
-          onClick={(e: React.MouseEvent) => {
-            e.stopPropagation();
-            if (needsContract) { onOpenContract?.(); return; }
-            if (pickerOpen) {
-              closePicker();
-            } else {
-              openPicker();
-              onExpandSelf?.();
-            }
-          }}
-          className={`px-2 py-0.5 text-[10px] font-medium rounded-sm border transition-colors ${
-            disabled
-              ? 'bg-sas-panel border-sas-border text-sas-muted/50 cursor-not-allowed'
-              : pickerOpen
-                ? 'bg-sas-accent border-sas-accent text-sas-bg'
-                : 'bg-sas-accent/10 border-sas-accent/30 text-sas-accent hover:bg-sas-accent/20'
-          }`}
-        >
-          {pickerOpen ? 'Close' : '+ Add'}
-        </button>
+        {(!canCrossfade || !designerView) && (
+          <button
+            data-testid="import-sample-button"
+            onClick={(e: React.MouseEvent) => {
+              e.stopPropagation();
+              if (needsContract) { onOpenContract?.(); return; }
+              handleImport();
+            }}
+            className={`px-2 py-0.5 text-[10px] font-medium rounded-sm border transition-colors ${
+              needsContract || !isConnected
+                ? 'bg-sas-panel border-sas-border text-sas-muted/50 cursor-not-allowed'
+                : 'bg-sas-panel-alt border-sas-border text-sas-muted hover:border-sas-accent hover:text-sas-accent'
+            }`}
+          >
+            Load
+          </button>
+        )}
+        {(!canCrossfade || !designerView) && (
+          <button
+            data-testid="add-sample-button"
+            onClick={(e: React.MouseEvent) => {
+              e.stopPropagation();
+              if (needsContract) { onOpenContract?.(); return; }
+              if (pickerOpen) {
+                closePicker();
+              } else {
+                openPicker();
+                onExpandSelf?.();
+              }
+            }}
+            className={`px-2 py-0.5 text-[10px] font-medium rounded-sm border transition-colors ${
+              disabled
+                ? 'bg-sas-panel border-sas-border text-sas-muted/50 cursor-not-allowed'
+                : pickerOpen
+                  ? 'bg-sas-accent border-sas-accent text-sas-bg'
+                  : 'bg-sas-accent/10 border-sas-accent/30 text-sas-accent hover:bg-sas-accent/20'
+            }`}
+          >
+            {pickerOpen ? 'Close' : '+ Add'}
+          </button>
+        )}
+        {canCrossfade && (
+          <button
+            data-testid="loops-view-toggle"
+            onClick={(e: React.MouseEvent) => {
+              e.stopPropagation();
+              if (!designerView) {
+                if (needsContract) { onOpenContract?.(); return; }
+                onExpandSelf?.();
+              }
+              setDesignerView((v) => !v);
+            }}
+            disabled={!designerView && needsContract}
+            title={designerView ? 'Back to the loop list' : 'Open the transition designer'}
+            className="relative overflow-hidden px-2 py-0.5 text-[10px] font-medium rounded-sm border border-sas-accent/40 text-sas-accent transition-colors hover:border-sas-accent disabled:opacity-50"
+          >
+            {transitionSourceTotal > 0 && (
+              <span
+                className="absolute inset-y-0 left-0 bg-sas-accent/25"
+                style={{ width: `${Math.min(100, (transitionDone / transitionSourceTotal) * 100)}%` }}
+                aria-hidden
+              />
+            )}
+            <span className="relative">
+              ⇄ {designerView ? 'Transition' : 'Loops'}
+              {transitionSourceTotal > 0 ? ` ${transitionDone}/${transitionSourceTotal}` : ''}
+            </span>
+          </button>
+        )}
       </div>
     );
     return () => { onHeaderContent(null); };
-  }, [onHeaderContent, isConnected, activeSceneId, tracks.length, pickerOpen, openPicker, closePicker, handleImport, needsContract, onOpenContract, host]);
+  }, [onHeaderContent, isConnected, activeSceneId, tracks.length, pickerOpen, openPicker, closePicker, handleImport, needsContract, onOpenContract, host, designerView, canCrossfade, transitionDone, transitionSourceTotal, onExpandSelf]);
 
   // ─── Push loading state to accordion header ────────────────────────
   useEffect(() => {
@@ -700,6 +781,174 @@ export function LoopsPanel({
       }).catch(() => {});
     }
   }, [host, tracks]);
+
+  // ─── Transition Designer handlers (audio crossfade / fade) ──────────
+  const applyCrossfadeAutomation = useCallback(
+    async (originTrackId: string, targetTrackId: string, bars: number, bpm: number, sliderPos: number): Promise<void> => {
+      if (!host.setTrackVolumeAutomation) return;
+      const curves = buildCrossfadeVolumeCurves(bars, bpm, sliderPos);
+      await host.setTrackVolumeAutomation(originTrackId, curves.origin).catch(() => {});
+      await host.setTrackVolumeAutomation(targetTrackId, curves.target).catch(() => {});
+    }, [host]);
+  const applyFadeAutomation = useCallback(
+    async (trackId: string, direction: FadeDirection, bars: number, bpm: number, sliderPos: number, gesture: FadeGesture): Promise<void> => {
+      if (!host.setTrackVolumeAutomation) return;
+      const points = buildFadeVolumeCurve(bars, bpm, direction, sliderPos, gesture);
+      await host.setTrackVolumeAutomation(trackId, points).catch(() => {});
+    }, [host]);
+
+  // Resolve a source loop → fit it to the transition scene → create a sample track
+  // in the active (transition) scene. Returns the new handle + a caption label.
+  const placeLoop = useCallback(async (sourceDbId: string): Promise<{ handle: PluginTrackHandle; label: string } | null> => {
+    if (!host.getSampleTrackInfo) return null;
+    const info = await host.getSampleTrackInfo(sourceDbId);
+    if (!info) return null;
+    let sampleId = info.sampleId;
+    try { sampleId = (await host.fitSampleToScene(sampleId)).id; } catch { /* fit best-effort */ }
+    const handle = await host.createSampleTrack(sampleId);
+    return { handle, label: info.fileName ?? handle.name };
+  }, [host]);
+
+  const handleCreateCrossfade = useCallback(
+    async (origin: CrossfadeSelection, target: CrossfadeSelection): Promise<void> => {
+      const scene = activeSceneId;
+      const fromSceneId = sceneContext?.transitionFromSceneId ?? '';
+      const toSceneId = sceneContext?.transitionToSceneId ?? '';
+      if (!scene) throw new Error('No active scene.');
+      if (!isConnected) throw new Error('Systems not connected.');
+      if (tracks.length + 2 > MAX_TRACKS) throw new Error('Not enough track slots for a crossfade.');
+      const created: PluginTrackHandle[] = [];
+      try {
+        const mc = await host.getMusicalContext();
+        // Audio crossfade: place loop A + loop B; A fades out, B fades in. No MIDI.
+        const originPlaced = await placeLoop(origin.dbId);
+        if (!originPlaced) throw new Error('Origin loop is no longer available.');
+        created.push(originPlaced.handle);
+        const targetPlaced = await placeLoop(target.dbId);
+        if (!targetPlaced) throw new Error('Target loop is no longer available.');
+        created.push(targetPlaced.handle);
+        await applyCrossfadeAutomation(originPlaced.handle.id, targetPlaced.handle.id, mc.bars, mc.bpm, 0.5);
+        const groupId = originPlaced.handle.dbId;
+        const originMeta: CrossfadeMeta = {
+          groupId, slot: 'origin', partnerDbId: targetPlaced.handle.dbId, sourceTrackDbId: origin.dbId,
+          sourceSceneId: fromSceneId, sourceName: origin.name, soundLabel: originPlaced.label, sliderPos: 0.5,
+        };
+        const targetMeta: CrossfadeMeta = {
+          groupId, slot: 'target', partnerDbId: originPlaced.handle.dbId, sourceTrackDbId: target.dbId,
+          sourceSceneId: toSceneId, sourceName: target.name, soundLabel: targetPlaced.label, sliderPos: 0.5,
+        };
+        await host.setSceneData(scene, `track:${originPlaced.handle.dbId}:crossfade`, originMeta);
+        await host.setSceneData(scene, `track:${targetPlaced.handle.dbId}:crossfade`, targetMeta);
+        await loadTracks();
+        host.showToast('success', 'Crossfade created', `${origin.name} → ${target.name}`);
+      } catch (err: unknown) {
+        for (const h of [...created].reverse()) { try { await host.deleteSampleTrack(h.id); } catch { /* best effort */ } }
+        throw err instanceof Error ? err : new Error(String(err));
+      }
+    },
+    [host, activeSceneId, isConnected, tracks.length, sceneContext, placeLoop, applyCrossfadeAutomation, loadTracks],
+  );
+
+  const handleCreateFade = useCallback(
+    async (selection: FadeSelection, direction: FadeDirection, _gesture: FadeGesture): Promise<void> => {
+      const scene = activeSceneId;
+      const fromSceneId = sceneContext?.transitionFromSceneId ?? '';
+      const toSceneId = sceneContext?.transitionToSceneId ?? '';
+      if (!scene) throw new Error('No active scene.');
+      if (!isConnected) throw new Error('Systems not connected.');
+      if (tracks.length + 1 > MAX_TRACKS) throw new Error('Not enough track slots for a fade.');
+      // Audio fades are always a level ramp — the MIDI 'build' gesture has no analog.
+      const gesture: FadeGesture = 'volume';
+      const sourceSceneId = direction === 'out' ? fromSceneId : toSceneId;
+      const created: PluginTrackHandle[] = [];
+      try {
+        const mc = await host.getMusicalContext();
+        const placed = await placeLoop(selection.dbId);
+        if (!placed) throw new Error('Loop is no longer available.');
+        created.push(placed.handle);
+        await applyFadeAutomation(placed.handle.id, direction, mc.bars, mc.bpm, 0.5, gesture);
+        appliedFadeAutomationRef.current.add(placed.handle.id);
+        const meta: FadeMeta = {
+          direction, gesture, sourceTrackDbId: selection.dbId, sourceSceneId,
+          sourceName: selection.name, soundLabel: placed.label, sliderPos: 0.5,
+        };
+        await host.setSceneData(scene, `track:${placed.handle.dbId}:fade`, meta);
+        await loadTracks();
+        host.showToast('success', direction === 'in' ? 'Fade in created' : 'Fade out created', selection.name);
+      } catch (err: unknown) {
+        for (const h of [...created].reverse()) { try { await host.deleteSampleTrack(h.id); } catch { /* best effort */ } }
+        throw err instanceof Error ? err : new Error(String(err));
+      }
+    },
+    [host, activeSceneId, isConnected, tracks.length, sceneContext, placeLoop, applyFadeAutomation, loadTracks],
+  );
+
+  // Resolve committed pairs/fades against live tracks (only complete pairs group).
+  const { resolvedCrossfadePairs, crossfadeMemberDbIds } = useMemo(() => {
+    const byDbId = new Map(tracks.map((t) => [t.handle.dbId, t]));
+    const pairs: ResolvedCrossfadePair[] = [];
+    const members = new Set<string>();
+    for (const p of crossfadePairsMeta) {
+      const origin = byDbId.get(p.originDbId);
+      const target = byDbId.get(p.targetDbId);
+      if (origin && target) { pairs.push({ ...p, origin, target }); members.add(p.originDbId); members.add(p.targetDbId); }
+    }
+    return { resolvedCrossfadePairs: pairs, crossfadeMemberDbIds: members };
+  }, [tracks, crossfadePairsMeta]);
+  const { resolvedFades, fadeMemberDbIds } = useMemo(() => {
+    const byDbId = new Map(tracks.map((t) => [t.handle.dbId, t]));
+    const list: ResolvedFade[] = [];
+    const members = new Set<string>();
+    for (const f of fadesMeta) {
+      const track = byDbId.get(f.dbId);
+      if (track) { list.push({ ...f, track }); members.add(f.dbId); }
+    }
+    return { resolvedFades: list, fadeMemberDbIds: members };
+  }, [tracks, fadesMeta]);
+
+  // Re-apply each fade's volume curve on load (NOT engine-persisted).
+  useEffect(() => {
+    if (!host.setTrackVolumeAutomation || resolvedFades.length === 0) return;
+    void (async () => {
+      const mc = await host.getMusicalContext();
+      for (const fade of resolvedFades) {
+        const id = fade.track.handle.id;
+        if (appliedFadeAutomationRef.current.has(id)) continue;
+        appliedFadeAutomationRef.current.add(id);
+        await applyFadeAutomation(id, fade.meta.direction, mc.bars, mc.bpm, fade.meta.sliderPos, fade.meta.gesture);
+      }
+    })();
+  }, [host, resolvedFades, applyFadeAutomation]);
+
+  const excludeSourceDbIds = useMemo(() => [
+    ...crossfadePairsMeta.flatMap((p) => [p.originSourceDbId, p.targetSourceDbId]),
+    ...fadesMeta.map((f) => f.meta.sourceTrackDbId),
+  ], [crossfadePairsMeta, fadesMeta]);
+
+  const handleCrossfadeDelete = useCallback(async (pair: ResolvedCrossfadePair): Promise<void> => {
+    try {
+      for (const member of [pair.origin, pair.target]) {
+        await host.deleteSampleTrack(member.handle.id);
+        if (activeSceneId) await host.deleteSceneData(activeSceneId, `track:${member.handle.dbId}:crossfade`);
+      }
+      setCrossfadePairsMeta((prev) => prev.filter((p) => p.groupId !== pair.groupId));
+      setTracks((prev) => prev.filter((t) => t.handle.id !== pair.origin.handle.id && t.handle.id !== pair.target.handle.id));
+      host.showToast('success', 'Crossfade removed');
+    } catch (err: unknown) {
+      host.showToast('error', 'Failed to delete crossfade', err instanceof Error ? err.message : String(err));
+    }
+  }, [host, activeSceneId]);
+  const handleFadeDelete = useCallback(async (fade: ResolvedFade): Promise<void> => {
+    try {
+      await host.deleteSampleTrack(fade.track.handle.id);
+      if (activeSceneId) await host.deleteSceneData(activeSceneId, `track:${fade.dbId}:fade`);
+      setFadesMeta((prev) => prev.filter((f) => f.dbId !== fade.dbId));
+      setTracks((prev) => prev.filter((t) => t.handle.id !== fade.track.handle.id));
+      host.showToast('success', 'Fade removed');
+    } catch (err: unknown) {
+      host.showToast('error', 'Failed to delete fade', err instanceof Error ? err.message : String(err));
+    }
+  }, [host, activeSceneId]);
 
   // ─── Filtered samples for picker ─────────────────────────────────
   const BPM_TOLERANCE = 2;
@@ -975,11 +1224,93 @@ export function LoopsPanel({
         </div>
       )}
 
-      {/* Track list */}
-      {isLoadingTracks ? (
+      {/* Transition Designer — stays mounted so in-flight creates survive a toggle */}
+      {canCrossfade && xfFromId && xfToId && (
+        <div className={designerView ? 'contents' : 'hidden'}>
+          <TransitionDesigner
+            host={host}
+            fromSceneId={xfFromId}
+            toSceneId={xfToId}
+            transitionSceneId={activeSceneId ?? ''}
+            excludeSourceDbIds={excludeSourceDbIds}
+            onCreateCrossfade={handleCreateCrossfade}
+            onCreateFade={handleCreateFade}
+            familyLabel="Loops"
+            testIdPrefix="loops-transition-designer"
+          />
+        </div>
+      )}
+
+      {/* Track list (hidden while the designer is shown) */}
+      {!(designerView && canCrossfade) && (isLoadingTracks ? (
         <div className="text-sas-muted text-xs text-center py-4">Loading tracks...</div>
       ) : (
-        tracks.map((track: SampleTrackState) => (
+        <>
+          {resolvedCrossfadePairs.map((pair: ResolvedCrossfadePair) => (
+            <CrossfadeTrackRow
+              key={pair.groupId}
+              accentColor="#9333EA"
+              levels={supportsMeters ? trackLevels : undefined}
+              sliderPos={pair.sliderPos}
+              origin={{
+                trackId: pair.origin.handle.id,
+                name: pair.origin.handle.name,
+                role: undefined,
+                sourceName: pair.originSourceName,
+                soundLabel: pair.originSoundLabel,
+                runtimeState: pair.origin.runtimeState,
+              }}
+              target={{
+                trackId: pair.target.handle.id,
+                name: pair.target.handle.name,
+                role: undefined,
+                sourceName: pair.targetSourceName,
+                soundLabel: pair.targetSoundLabel,
+                runtimeState: pair.target.runtimeState,
+              }}
+              onMuteToggle={() => {
+                const next = !pair.origin.runtimeState.muted;
+                setTracks((prev) => prev.map((t) => (t.handle.id === pair.origin.handle.id || t.handle.id === pair.target.handle.id) ? { ...t, runtimeState: { ...t.runtimeState, muted: next } } : t));
+                host.setTrackMute(pair.origin.handle.id, next).catch(() => {});
+                host.setTrackMute(pair.target.handle.id, next).catch(() => {});
+              }}
+              onSoloToggle={() => {
+                const next = !pair.origin.runtimeState.solo;
+                setTracks((prev) => prev.map((t) => (t.handle.id === pair.origin.handle.id || t.handle.id === pair.target.handle.id) ? { ...t, runtimeState: { ...t.runtimeState, solo: next } } : t));
+                host.setTrackSolo(pair.origin.handle.id, next).catch(() => {});
+                host.setTrackSolo(pair.target.handle.id, next).catch(() => {});
+              }}
+              onVolumeChange={(slot: CrossfadeSlot, vol: number) =>
+                handleVolumeChange(slot === 'origin' ? pair.origin.handle.id : pair.target.handle.id, vol)}
+              onPanChange={(slot: CrossfadeSlot, pan: number) =>
+                handlePanChange(slot === 'origin' ? pair.origin.handle.id : pair.target.handle.id, pan)}
+              onDelete={() => handleCrossfadeDelete(pair)}
+            />
+          ))}
+          {resolvedFades.map((fade: ResolvedFade) => (
+            <FadeTrackRow
+              key={fade.dbId}
+              accentColor="#9333EA"
+              levels={supportsMeters ? trackLevels : undefined}
+              direction={fade.meta.direction}
+              gesture={fade.meta.gesture}
+              sliderPos={fade.meta.sliderPos}
+              layer={{
+                trackId: fade.track.handle.id,
+                name: fade.track.handle.name,
+                role: undefined,
+                sourceName: fade.meta.sourceName,
+                soundLabel: fade.meta.soundLabel,
+                runtimeState: fade.track.runtimeState,
+              }}
+              onMuteToggle={() => handleMuteToggle(fade.track.handle.id)}
+              onSoloToggle={() => handleSoloToggle(fade.track.handle.id)}
+              onVolumeChange={(vol: number) => handleVolumeChange(fade.track.handle.id, vol)}
+              onPanChange={(pan: number) => handlePanChange(fade.track.handle.id, pan)}
+              onDelete={() => handleFadeDelete(fade)}
+            />
+          ))}
+          {tracks.filter((t: SampleTrackState) => !crossfadeMemberDbIds.has(t.handle.dbId) && !fadeMemberDbIds.has(t.handle.dbId)).map((track: SampleTrackState) => (
           <TrackRow
             key={track.handle.id}
             track={{ id: track.handle.id, name: track.handle.name }}
@@ -1025,8 +1356,9 @@ export function LoopsPanel({
               </div>
             }
           />
-        ))
-      )}
+          ))}
+        </>
+      ))}
     </div>
   );
 }

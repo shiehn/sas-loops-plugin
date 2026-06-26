@@ -18,6 +18,16 @@ import type { PluginHost, PluginTrackHandle, PluginSampleInfo } from '@signalsan
 // Mock the SDK package used by LoopsPanel — only the runtime exports.
 jest.mock('@signalsandsorcery/plugin-sdk', () => ({
   TrackRow: () => <div data-testid="track-row" />,
+  ImportTrackModal: () => null,
+  TransitionDesigner: () => <div data-testid="transition-designer" />,
+  CrossfadeTrackRow: () => <div data-testid="crossfade-row" />,
+  FadeTrackRow: () => <div data-testid="fade-row" />,
+  useTrackLevels: () => null,
+  useAnySolo: () => false,
+  parseCrossfadePairs: () => [],
+  parseFades: () => [],
+  buildCrossfadeVolumeCurves: () => ({ origin: [], target: [] }),
+  buildFadeVolumeCurve: () => [],
   EMPTY_FX_DETAIL_STATE: {
     eq: { enabled: false, presetIndex: 0, dryWet: 1.0 },
     compressor: { enabled: false, presetIndex: 0, dryWet: 1.0 },
