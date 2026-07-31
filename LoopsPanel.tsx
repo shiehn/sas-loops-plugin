@@ -886,11 +886,13 @@ export function LoopsPanel({
     [host, activeSceneId, isConnected, tracks.length, sceneContext, placeLoop, applyFadeAutomation, loadTracks],
   );
 
-  // Audio-only one-sided transition (stutter / chopped / delay). Stutter & chopped
-  // RENDER a new WAV (renderSampleEffect); delay places the loop + a delay-throw FX.
-  // All three ramp the loop in/out across the transition.
+  // Audio-only one-sided transition (stutter / chopped / delay / filter).
+  // Stutter, chopped & filter RENDER a new WAV (renderSampleEffect — filter is a
+  // direction-tied highpass sweep: out climbs 20→2400 Hz, in descends); delay
+  // places the loop + a delay-throw FX. All ramp the loop in/out across the
+  // transition.
   const handleCreateAudioTransition = useCallback(
-    async (selection: FadeSelection, direction: FadeDirection, effect: 'stutter' | 'chopped' | 'delay'): Promise<void> => {
+    async (selection: FadeSelection, direction: FadeDirection, effect: 'stutter' | 'chopped' | 'delay' | 'filter' | 'tape-stop'): Promise<void> => {
       const scene = activeSceneId;
       const fromSceneId = sceneContext?.transitionFromSceneId ?? '';
       const toSceneId = sceneContext?.transitionToSceneId ?? '';
@@ -905,10 +907,26 @@ export function LoopsPanel({
         const info = await host.getSampleTrackInfo(selection.dbId);
         if (!info) throw new Error('Loop is no longer available.');
         let sampleId = info.sampleId;
-        // Stutter / chopped re-render the loop's audio offline into a new sample.
-        if (effect === 'stutter' || effect === 'chopped') {
+        // Stutter / chopped / filter re-render the loop's audio offline into a
+        // new sample (filter sweeps the cutoff with the fade direction).
+        if (effect === 'stutter' || effect === 'chopped' || effect === 'filter' || effect === 'tape-stop') {
           if (!host.renderSampleEffect) throw new Error(`${effect} requires a newer host build.`);
-          const rendered = await host.renderSampleEffect(sampleId, { effect, bars: mc.bars, bpm: mc.bpm });
+          const rendered = await host.renderSampleEffect(sampleId, {
+            effect, bars: mc.bars, bpm: mc.bpm,
+            ...(effect === 'filter'
+              ? {
+                  filterType: 'highpass' as const,
+                  startHz: direction === 'out' ? 20 : 2400,
+                  endHz: direction === 'out' ? 2400 : 20,
+                }
+              : {}),
+            ...(effect === 'tape-stop'
+              ? {
+                  tapeDirection: (direction === 'out' ? 'stop' : 'start') as 'stop' | 'start',
+                  tapeSpanSeconds: (60 / mc.bpm) * 4,
+                }
+              : {}),
+          });
           sampleId = rendered.id;
         }
         try { sampleId = (await host.fitSampleToScene(sampleId)).id; } catch { /* fit best-effort */ }
