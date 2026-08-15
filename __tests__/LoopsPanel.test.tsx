@@ -28,14 +28,6 @@ jest.mock('@signalsandsorcery/plugin-sdk', () => ({
   parseFades: () => [],
   buildCrossfadeVolumeCurves: () => ({ origin: [], target: [] }),
   buildFadeVolumeCurve: () => [],
-  EMPTY_FX_DETAIL_STATE: {
-    eq: { enabled: false, presetIndex: 0, dryWet: 1.0 },
-    compressor: { enabled: false, presetIndex: 0, dryWet: 1.0 },
-    chorus: { enabled: false, presetIndex: 0, dryWet: 1.0 },
-    phaser: { enabled: false, presetIndex: 0, dryWet: 1.0 },
-    delay: { enabled: false, presetIndex: 0, dryWet: 1.0 },
-    reverb: { enabled: false, presetIndex: 0, dryWet: 1.0 },
-  },
 }));
 
 jest.mock('react-icons/gi', () => ({
@@ -86,17 +78,6 @@ function makeMockHost(overrides?: Record<string, any>): PluginHost {
     setTrackPan: fn().mockResolvedValue(undefined),
     setTrackSolo: fn().mockResolvedValue(undefined),
     setTrackName: fn().mockResolvedValue(undefined),
-    getTrackFxState: fn().mockResolvedValue({
-      eq: { enabled: false, presetIndex: 0, dryWet: 1.0 },
-      compressor: { enabled: false, presetIndex: 0, dryWet: 1.0 },
-      chorus: { enabled: false, presetIndex: 0, dryWet: 0.5 },
-      phaser: { enabled: false, presetIndex: 0, dryWet: 0.5 },
-      delay: { enabled: false, presetIndex: 0, dryWet: 0.3 },
-      reverb: { enabled: false, presetIndex: 0, dryWet: 0.3 },
-    }),
-    toggleTrackFx: fn().mockResolvedValue(undefined),
-    setTrackFxPreset: fn().mockResolvedValue({}),
-    setTrackFxDryWet: fn().mockResolvedValue(undefined),
 
     // Listeners
     onTrackStateChange: fn().mockReturnValue(() => {}),

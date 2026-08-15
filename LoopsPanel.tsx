@@ -20,12 +20,8 @@ import type {
   PluginSampleTrackInfo,
   PluginTrackHandle,
   PluginTrackRuntimeState,
-  PluginTrackFxDetailState,
-  PluginFxCategoryDetailState,
-  FxCategory,
-  TrackFxDetailState,
 } from '@signalsandsorcery/plugin-sdk';
-import { TrackRow, type DrawerTab, useAnySolo, EMPTY_FX_DETAIL_STATE, ImportTrackModal, useTrackLevels, TransitionDesigner, CrossfadeTrackRow, FadeTrackRow, parseCrossfadePairs, parseFades, buildCrossfadeVolumeCurves, buildFadeVolumeCurve, type CrossfadeSlot, type CrossfadeSelection, type CrossfadeMeta, type CrossfadePairMeta, type FadeDirection, type FadeGesture, type FadeMeta, type FadeEntry, type FadeSelection } from '@signalsandsorcery/plugin-sdk';
+import { TrackRow, type DrawerTab, useAnySolo, ImportTrackModal, useTrackLevels, TransitionDesigner, CrossfadeTrackRow, FadeTrackRow, parseCrossfadePairs, parseFades, buildCrossfadeVolumeCurves, buildFadeVolumeCurve, type CrossfadeSlot, type CrossfadeSelection, type CrossfadeMeta, type CrossfadePairMeta, type FadeDirection, type FadeGesture, type FadeMeta, type FadeEntry, type FadeSelection } from '@signalsandsorcery/plugin-sdk';
 
 // The factory loop/sample library ships as the `sas-loop-library` pack. The
 // plugin only needs the packId — the HOST owns the download + the post-extract
@@ -50,7 +46,6 @@ interface SampleTrackState {
   handle: PluginTrackHandle;
   sample: PluginSampleInfo;
   runtimeState: PluginTrackRuntimeState;
-  fxDetailState: TrackFxDetailState;
   // Unified drawer state. Loops support only the FX tab, so the strip is hidden
   // and the drawer renders FX directly (drawerTab is always 'fx').
   drawerOpen: boolean;
@@ -186,8 +181,8 @@ export function LoopsPanel({
   // ─── Load tracks when scene changes ──────────────────────────────
   // Stale-scene guard: `tracks` is keyed implicitly by activeSceneId, but
   // React keeps the prior scene's tracks until loadTracks finishes its
-  // async fetch (DB query + per-track getTrackInfo + per-track
-  // getTrackFxState — several hundred ms in practice). During that window
+  // async fetch (DB query + per-track getTrackInfo — several hundred ms in
+  // practice). During that window
   // the new scene's panel renders the OLD scene's sample rows. Clear on
   // real scene transitions so the gap is empty, not stale.
   const tracksLoadedForSceneRef = useRef<string | null>(null);
@@ -248,20 +243,10 @@ export function LoopsPanel({
           // Use defaults from sampleTrack info
         }
 
-        // Get FX state
-        let fxDetailState: TrackFxDetailState = { ...EMPTY_FX_DETAIL_STATE };
-        try {
-          const fxState = await host.getTrackFxState(st.track.id);
-          fxDetailState = pluginFxToToggleFx(fxState);
-        } catch {
-          // Use defaults
-        }
-
         trackStates.push({
           handle: st.track,
           sample: st.sample,
           runtimeState,
-          fxDetailState,
           drawerOpen: false,
           drawerTab: 'fx',
         });
@@ -488,7 +473,6 @@ export function LoopsPanel({
           volume: 0.75,
           pan: 0,
         },
-        fxDetailState: { ...EMPTY_FX_DETAIL_STATE },
         drawerOpen: false,
         drawerTab: 'fx',
       };
@@ -724,66 +708,13 @@ export function LoopsPanel({
     host.setTrackPan(trackId, pan).catch(() => {});
   }, [host]);
 
-  // ─── FX handlers ───────────────────────────────────────────────────
-  const handleFxToggle = useCallback((trackId: string, category: FxCategory, enabled: boolean): void => {
-    setTracks((prev: SampleTrackState[]) => prev.map((t: SampleTrackState) =>
-      t.handle.id === trackId
-        ? { ...t, fxDetailState: { ...t.fxDetailState, [category]: { ...t.fxDetailState[category], enabled } } }
-        : t
-    ));
-    host.toggleTrackFx(trackId, category, enabled).catch(() => {
-      // Rollback on failure
-      setTracks((prev: SampleTrackState[]) => prev.map((t: SampleTrackState) =>
-        t.handle.id === trackId
-          ? { ...t, fxDetailState: { ...t.fxDetailState, [category]: { ...t.fxDetailState[category], enabled: !enabled } } }
-          : t
-      ));
-    });
-  }, [host]);
-
-  const handleFxPresetChange = useCallback((trackId: string, category: FxCategory, presetIndex: number): void => {
-    setTracks((prev: SampleTrackState[]) => prev.map((t: SampleTrackState) =>
-      t.handle.id === trackId
-        ? { ...t, fxDetailState: { ...t.fxDetailState, [category]: { ...t.fxDetailState[category], presetIndex } } }
-        : t
-    ));
-    host.setTrackFxPreset(trackId, category, presetIndex).then((result: { dryWet?: number }) => {
-      if (result.dryWet !== undefined) {
-        setTracks((prev: SampleTrackState[]) => prev.map((t: SampleTrackState) =>
-          t.handle.id === trackId
-            ? { ...t, fxDetailState: { ...t.fxDetailState, [category]: { ...t.fxDetailState[category], dryWet: result.dryWet as number } } }
-            : t
-        ));
-      }
-    }).catch(() => {});
-  }, [host]);
-
-  const handleFxDryWetChange = useCallback((trackId: string, category: FxCategory, value: number): void => {
-    setTracks((prev: SampleTrackState[]) => prev.map((t: SampleTrackState) =>
-      t.handle.id === trackId
-        ? { ...t, fxDetailState: { ...t.fxDetailState, [category]: { ...t.fxDetailState[category], dryWet: value } } }
-        : t
-    ));
-    host.setTrackFxDryWet(trackId, category, value).catch(() => {});
-  }, [host]);
-
   const toggleFxDrawer = useCallback((trackId: string): void => {
     setTracks((prev: SampleTrackState[]) => prev.map((t: SampleTrackState) => {
       if (t.handle.id !== trackId) return t;
       const onFx = t.drawerOpen && t.drawerTab === 'fx';
       return { ...t, drawerOpen: !onFx, drawerTab: 'fx' };
     }));
-    // Refresh FX state when opening the FX tab
-    const track = tracks.find((t: SampleTrackState) => t.handle.id === trackId);
-    const wasOnFx = !!track && track.drawerOpen && track.drawerTab === 'fx';
-    if (track && !wasOnFx) {
-      host.getTrackFxState(trackId).then((fxState: PluginTrackFxDetailState) => {
-        setTracks((prev: SampleTrackState[]) => prev.map((t: SampleTrackState) =>
-          t.handle.id === trackId ? { ...t, fxDetailState: pluginFxToToggleFx(fxState) } : t
-        ));
-      }).catch(() => {});
-    }
-  }, [host, tracks]);
+  }, []);
 
   // ─── Transition Designer handlers (audio crossfade / fade) ──────────
   const applyCrossfadeAutomation = useCallback(
@@ -886,11 +817,11 @@ export function LoopsPanel({
     [host, activeSceneId, isConnected, tracks.length, sceneContext, placeLoop, applyFadeAutomation, loadTracks],
   );
 
-  // Audio-only one-sided transition (stutter / chopped / delay / filter).
-  // Stutter, chopped & filter RENDER a new WAV (renderSampleEffect — filter is a
-  // direction-tied highpass sweep: out climbs 20→2400 Hz, in descends); delay
-  // places the loop + a delay-throw FX. All ramp the loop in/out across the
-  // transition.
+  // Audio-only one-sided transition (stutter / chopped / delay / filter /
+  // tape-stop). Every effect RENDERS a new WAV offline (renderSampleEffect —
+  // filter is a direction-tied highpass sweep: out climbs 20→2400 Hz, in
+  // descends; delay is an offline feedback-echo throw). All ramp the loop
+  // in/out across the transition.
   const handleCreateAudioTransition = useCallback(
     async (selection: FadeSelection, direction: FadeDirection, effect: 'stutter' | 'chopped' | 'delay' | 'filter' | 'tape-stop'): Promise<void> => {
       const scene = activeSceneId;
@@ -907,37 +838,32 @@ export function LoopsPanel({
         const info = await host.getSampleTrackInfo(selection.dbId);
         if (!info) throw new Error('Loop is no longer available.');
         let sampleId = info.sampleId;
-        // Stutter / chopped / filter re-render the loop's audio offline into a
-        // new sample (filter sweeps the cutoff with the fade direction).
-        if (effect === 'stutter' || effect === 'chopped' || effect === 'filter' || effect === 'tape-stop') {
-          if (!host.renderSampleEffect) throw new Error(`${effect} requires a newer host build.`);
-          const rendered = await host.renderSampleEffect(sampleId, {
-            effect, bars: mc.bars, bpm: mc.bpm,
-            ...(effect === 'filter'
-              ? {
-                  filterType: 'highpass' as const,
-                  startHz: direction === 'out' ? 20 : 2400,
-                  endHz: direction === 'out' ? 2400 : 20,
-                }
-              : {}),
-            ...(effect === 'tape-stop'
-              ? {
-                  tapeDirection: (direction === 'out' ? 'stop' : 'start') as 'stop' | 'start',
-                  tapeSpanSeconds: (60 / mc.bpm) * 4,
-                }
-              : {}),
-          });
-          sampleId = rendered.id;
-        }
+        // Every effect re-renders the loop's audio offline into a new sample
+        // (filter sweeps the cutoff with the fade direction; delay renders a
+        // feedback-echo throw with the SDK's default delay params).
+        if (!host.renderSampleEffect) throw new Error(`${effect} requires a newer host build.`);
+        const rendered = await host.renderSampleEffect(sampleId, {
+          effect, bars: mc.bars, bpm: mc.bpm,
+          ...(effect === 'filter'
+            ? {
+                filterType: 'highpass' as const,
+                startHz: direction === 'out' ? 20 : 2400,
+                endHz: direction === 'out' ? 2400 : 20,
+              }
+            : {}),
+          ...(effect === 'tape-stop'
+            ? {
+                tapeDirection: (direction === 'out' ? 'stop' : 'start') as 'stop' | 'start',
+                tapeSpanSeconds: (60 / mc.bpm) * 4,
+              }
+            : {}),
+        });
+        sampleId = rendered.id;
         try { sampleId = (await host.fitSampleToScene(sampleId)).id; } catch { /* fit best-effort */ }
         const handle = await host.createSampleTrack(sampleId);
         created.push(handle);
         await applyFadeAutomation(handle.id, direction, mc.bars, mc.bpm, 0.5, 'volume');
         appliedFadeAutomationRef.current.add(handle.id);
-        // Delay → add a delay-throw FX preset on top of the fade.
-        if (effect === 'delay' && host.setTrackFxPreset) {
-          try { await host.setTrackFxPreset(handle.id, 'delay' as FxCategory, 0); } catch { /* fx best-effort */ }
-        }
         const meta: FadeMeta = {
           direction, gesture: 'volume', effect,
           sourceTrackDbId: selection.dbId, sourceSceneId,
@@ -1395,7 +1321,6 @@ export function LoopsPanel({
               pan: track.runtimeState.pan,
             }}
             soloedOut={anySolo && !track.runtimeState.solo}
-            fxDetailState={track.fxDetailState}
             drawerOpen={track.drawerOpen}
             drawerTab={track.drawerTab}
             onDelete={() => handleDeleteTrack(track.handle.id)}
@@ -1403,10 +1328,7 @@ export function LoopsPanel({
             onSoloToggle={() => handleSoloToggle(track.handle.id)}
             onVolumeChange={(vol: number) => handleVolumeChange(track.handle.id, vol)}
             onPanChange={(pan: number) => handlePanChange(track.handle.id, pan)}
-            onFxToggle={(cat: FxCategory, enabled: boolean) => handleFxToggle(track.handle.id, cat, enabled)}
             externalFxHost={host}
-            onFxPresetChange={(cat: FxCategory, idx: number) => handleFxPresetChange(track.handle.id, cat, idx)}
-            onFxDryWetChange={(cat: FxCategory, val: number) => handleFxDryWetChange(track.handle.id, cat, val)}
             onToggleFxDrawer={() => toggleFxDrawer(track.handle.id)}
             accentColor="#6AF2C5"
             contentSlot={
@@ -1435,26 +1357,6 @@ export function LoopsPanel({
       ))}
     </div>
   );
-}
-
-// ============================================================================
-// Helpers
-// ============================================================================
-
-/** Convert SDK PluginTrackFxDetailState to the FxToggleBar's expected TrackFxDetailState */
-function pluginFxToToggleFx(sdkState: PluginTrackFxDetailState): TrackFxDetailState {
-  const result = { ...EMPTY_FX_DETAIL_STATE };
-  for (const category of ['eq', 'compressor', 'chorus', 'phaser', 'delay', 'reverb'] as const) {
-    const sdkCat = sdkState[category] as PluginFxCategoryDetailState | undefined;
-    if (sdkCat) {
-      result[category] = {
-        enabled: sdkCat.enabled,
-        presetIndex: sdkCat.presetIndex,
-        dryWet: sdkCat.dryWet,
-      };
-    }
-  }
-  return result;
 }
 
 export default LoopsPanel;
