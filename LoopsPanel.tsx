@@ -10,6 +10,19 @@
  * host.onSamplePackProgress — the host downloads, extracts, and imports the
  * samples into the library, after which host.getSamples() returns them. No
  * window.electronAPI, no shared/constants import (W9 — no back doors).
+ *
+ * Three header buttons, three sources (S-015 / D-010):
+ *   - "From scene"  (import-from-scene-loops-button): copy loops from another scene.
+ *   - "From disk"   (import-sample-button): pick files → each is imported, fitted to
+ *                   the scene and put on a new track (handleLoadFromDisk). When a loop
+ *                   can't be placed it is still imported and the toast says why.
+ *   - "+ Library"   (add-sample-button): browse/search/preview the library picker.
+ * Both "From disk" and the picker place loops through ONE path (placeSample).
+ *
+ * "Recently imported" (S-015 / D-011) tops the picker when anything qualifies
+ * (rules in recently-imported.ts). When "From disk" places nothing (no scene,
+ * no contract, track limit, an old host, a scene-wide stop) the picker opens
+ * on it with the just-imported rows highlighted, so the pick is one click away.
  */
 
 import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react';
@@ -22,6 +35,25 @@ import type {
   PluginTrackRuntimeState,
 } from '@signalsandsorcery/plugin-sdk';
 import { TrackRow, type DrawerTab, useAnySolo, ImportTrackModal, useTrackLevels, TransitionDesigner, CrossfadeTrackRow, FadeTrackRow, parseCrossfadePairs, parseFades, buildCrossfadeVolumeCurves, buildFadeVolumeCurve, type CrossfadeSlot, type CrossfadeSelection, type CrossfadeMeta, type CrossfadePairMeta, type FadeDirection, type FadeGesture, type FadeMeta, type FadeEntry, type FadeSelection } from '@signalsandsorcery/plugin-sdk';
+import {
+  LIBRARY_BUTTON_LABEL,
+  describeSourceLoop,
+  emptyOutcome,
+  fileBaseName,
+  importErrorFor,
+  isSceneWideError,
+  perLoopMessage,
+  placementBlocker,
+  summarizeLoad,
+  type LeftReason,
+  type LoadOutcome,
+} from './load-from-disk';
+import {
+  RECENT_HIGHLIGHT_MS,
+  importedTitle,
+  selectRecentlyImported,
+  type RecentImport,
+} from './recently-imported';
 
 // The factory loop/sample library ships as the `sas-loop-library` pack. The
 // plugin only needs the packId — the HOST owns the download + the post-extract
@@ -99,6 +131,42 @@ export function LoopsPanel({
   const [isLoadingSamples, setIsLoadingSamples] = useState(false);
   const [stretchingIds, setStretchingIds] = useState<Set<string>>(new Set());
   const [previewingSampleId, setPreviewingSampleId] = useState<string | null>(null);
+
+  // ─── "From disk" batch progress (busy state on the button) ────────
+  // null = idle. `done` counts files handled so far (placed, left or failed).
+  const [diskLoad, setDiskLoad] = useState<{ done: number; total: number } | null>(null);
+  // Synchronous guard: a second click while the dialog is open or a batch runs is ignored.
+  const diskLoadBusyRef = useRef(false);
+
+  // ─── "Recently imported" (S-015 / D-011) ──────────────────────────
+  // Library ids this panel session imported via "From disk" → when (ms). They
+  // always count as recent (the "new" badge), which also keeps the section
+  // working on hosts that report no `origin` / `importedAt`.
+  const [sessionImports, setSessionImports] = useState<ReadonlyMap<string, number>>(() => new Map());
+  // Rows flashed after "From disk" opened the picker because nothing was placed.
+  const [highlightIds, setHighlightIds] = useState<ReadonlySet<string>>(() => new Set());
+  const rememberImports = useCallback((ids: readonly string[]): void => {
+    if (ids.length === 0) return;
+    const at = Date.now();
+    setSessionImports((prev: ReadonlyMap<string, number>) => {
+      const next = new Map(prev);
+      for (const id of ids) next.set(id, at);
+      return next;
+    });
+  }, []);
+  useEffect(() => {
+    if (highlightIds.size === 0) return;
+    const timer = setTimeout(() => setHighlightIds(new Set()), RECENT_HIGHLIGHT_MS);
+    return () => clearTimeout(timer);
+  }, [highlightIds]);
+
+  // Latest props for long async flows (a file dialog can stay open while the
+  // user switches scenes; a batch of fits takes seconds per loop). Read at
+  // decision time, never from a stale closure.
+  const liveRef = useRef({ activeSceneId, sceneContext, isConnected, trackCount: tracks.length });
+  liveRef.current = { activeSceneId, sceneContext, isConnected, trackCount: tracks.length };
+  const pickerOpenRef = useRef(pickerOpen);
+  pickerOpenRef.current = pickerOpen;
 
   // ─── Factory sample library availability ───────────────────────────
   // `hasAnySamples` starts as null (unknown) and becomes true/false after
@@ -341,9 +409,14 @@ export function LoopsPanel({
   }, [refreshHasAnySamples]);
 
   // ─── Load samples when picker opens ──────────────────────────────
-  const openPicker = useCallback(async (): Promise<void> => {
+  // `query` pre-fills the search box; `highlight` flashes those rows (the
+  // "From disk" nothing-placed hand-off). A plain open starts unfiltered.
+  const openPicker = useCallback(async (
+    options?: { query?: string; highlight?: readonly string[] },
+  ): Promise<void> => {
     setPickerOpen(true);
-    setSearchQuery('');
+    setSearchQuery(options?.query ?? '');
+    setHighlightIds(new Set(options?.highlight ?? []));
     setIsLoadingSamples(true);
     // Auto-focus the search input after picker renders
     setTimeout(() => {
@@ -426,103 +499,306 @@ export function LoopsPanel({
     setSearchQuery('');
   }, []);
 
-  // ─── Add sample track (auto-timestretches if BPM mismatch) ──────
+  // ─── Place one library sample on a new track (THE add path) ─────
+  // Fit to the active scene, create the sample track, append the row. Shared
+  // by the library picker (handleAddSample) and "From disk"
+  // (handleLoadFromDisk) so both place loops the same way. Throws on failure;
+  // callers own the gating and the messages.
+  const placeSample = useCallback(async (
+    sample: PluginSampleInfo,
+  ): Promise<{ handle: PluginTrackHandle; placed: PluginSampleInfo; fitted: boolean }> => {
+    // Fit the sample to the active scene's (bpm, length_bars). This
+    // composes time-stretch + chop/loop-stitch in a single host call
+    // (see `fitSampleToScene` in the SDK). Was a plain time-stretch
+    // before per-scene bar lengths shipped, which left 4-bar samples
+    // overflowing 2-bar scenes / under-filling 8-bar scenes.
+    const liveContext = liveRef.current.sceneContext;
+    const targetBpm = liveContext?.bpm ?? null;
+    const targetBars = liveContext?.bars ?? null;
+    const needsFit = targetBpm != null && targetBars != null && (
+      (sample.bpm != null && Math.abs(sample.bpm - targetBpm) > 0) ||
+      // Always fit when bars are available — the host may also need to
+      // chop / loop-stitch even when BPM already matches.
+      true
+    );
+
+    let sampleToLoad: PluginSampleInfo = sample;
+    if (needsFit) {
+      setStretchingIds(prev => new Set(prev).add(sample.id));
+      try {
+        sampleToLoad = await host.fitSampleToScene(sample.id);
+      } finally {
+        setStretchingIds(prev => { const next = new Set(prev); next.delete(sample.id); return next; });
+      }
+    }
+
+    const handle: PluginTrackHandle = await host.createSampleTrack(sampleToLoad.id);
+    const newTrack: SampleTrackState = {
+      handle,
+      sample: sampleToLoad,
+      runtimeState: {
+        id: handle.id,
+        muted: false,
+        solo: false,
+        volume: 0.75,
+        pan: 0,
+      },
+      drawerOpen: false,
+      drawerTab: 'fx',
+    };
+    setTracks((prev: SampleTrackState[]) => [...prev, newTrack]);
+    return { handle, placed: sampleToLoad, fitted: needsFit };
+  }, [host]);
+
+  // ─── Add sample track from the library picker ───────────────────
   const handleAddSample = useCallback(async (sample: PluginSampleInfo): Promise<void> => {
+    // The picker can be open with no scene / no contract (after "From disk"
+    // left loops in the library), so say what's missing and open it.
     if (!activeSceneId) {
-      host.showToast('warning', 'Select SCENE');
+      host.showToast('warning', 'Select a scene', 'Loops are added to the selected scene.');
+      onSelectScene?.();
+      return;
+    }
+    if (!sceneContext?.hasContract) {
+      host.showToast('info', 'Generate a contract first', 'This scene needs a contract before loops can be added.');
+      onOpenContract?.();
       return;
     }
     if (tracks.length >= MAX_TRACKS) {
-      host.showToast('warning', 'Track limit reached');
+      host.showToast('warning', 'Track limit reached', `This scene is at the ${MAX_TRACKS}-track loop limit: delete a track to add another.`);
+      return;
+    }
+    if (diskLoadBusyRef.current) {
+      host.showToast('info', 'Still adding loops from disk', 'Try again when they are done.');
       return;
     }
 
     try {
-      // Fit the sample to the active scene's (bpm, length_bars). This
-      // composes time-stretch + chop/loop-stitch in a single host call
-      // (see `fitSampleToScene` in the SDK). Was a plain time-stretch
-      // before per-scene bar lengths shipped, which left 4-bar samples
-      // overflowing 2-bar scenes / under-filling 8-bar scenes.
-      const targetBpm = sceneContext?.bpm ?? null;
-      const targetBars = sceneContext?.bars ?? null;
-      const needsFit = targetBpm != null && targetBars != null && (
-        (sample.bpm != null && Math.abs(sample.bpm - targetBpm) > 0) ||
-        // Always fit when bars are available — the host may also need to
-        // chop / loop-stitch even when BPM already matches.
-        true
-      );
-
-      let sampleToLoad: PluginSampleInfo = sample;
-      if (needsFit) {
-        setStretchingIds(prev => new Set(prev).add(sample.id));
-        try {
-          sampleToLoad = await host.fitSampleToScene(sample.id);
-        } finally {
-          setStretchingIds(prev => { const next = new Set(prev); next.delete(sample.id); return next; });
-        }
-      }
-
-      const handle: PluginTrackHandle = await host.createSampleTrack(sampleToLoad.id);
-      const newTrack: SampleTrackState = {
-        handle,
-        sample: sampleToLoad,
-        runtimeState: {
-          id: handle.id,
-          muted: false,
-          solo: false,
-          volume: 0.75,
-          pan: 0,
-        },
-        drawerOpen: false,
-        drawerTab: 'fx',
-      };
-      setTracks((prev: SampleTrackState[]) => [...prev, newTrack]);
+      const { fitted } = await placeSample(sample);
       closePicker();
       onExpandSelf?.();
-      host.showToast('success', needsFit ? 'Sample fitted & added' : 'Sample added');
+      host.showToast('success', fitted ? 'Sample fitted & added' : 'Sample added');
     } catch (error: unknown) {
       const msg = error instanceof Error ? error.message : 'Unknown error';
       host.showToast('error', 'Failed to add sample', msg);
     }
-  }, [host, activeSceneId, tracks.length, closePicker, sceneContext, onExpandSelf]);
+  }, [host, activeSceneId, sceneContext?.hasContract, tracks.length, closePicker, placeSample, onExpandSelf, onSelectScene, onOpenContract]);
 
-  // ─── Import samples ──────────────────────────────────────────────
-  const handleImport = useCallback(async (): Promise<void> => {
+  // ─── "From disk": import files, then place each on a new track ───
+  // D-010. Placement is attempted per file, in pick order: import → fit →
+  // track. The pick is never wasted: when loops can't be placed (no scene,
+  // no contract, not connected, track limit, a scene-wide host error, or a
+  // host older than SDK 3.18.0 that returns no sample ids) the files still go
+  // into the library and the closing toast says why and what to do next.
+  const handleLoadFromDisk = useCallback(async (): Promise<void> => {
+    if (diskLoadBusyRef.current) return;
+    diskLoadBusyRef.current = true;
+    const outcome: LoadOutcome = emptyOutcome(0);
+    // Library ids this batch resolved to (SDK 3.18.0 `samples`), in pick order.
+    const batchIds: string[] = [];
+    const noteImported = (ids: readonly string[]): void => {
+      for (const id of ids) if (!batchIds.includes(id)) batchIds.push(id);
+      rememberImports(ids);
+    };
     try {
       const filePaths: string[] | null = await host.showOpenDialog({
-        title: 'Import Samples',
+        title: 'Add loops from disk',
         filters: [{ name: 'Audio', extensions: AUDIO_EXTENSIONS }],
         multiSelections: true,
       });
+      if (!filePaths || filePaths.length === 0) return; // cancelled
 
-      if (!filePaths || filePaths.length === 0) return;
+      outcome.picked = filePaths.length;
+      setDiskLoad({ done: 0, total: filePaths.length });
 
-      const result = await host.importSamples(filePaths);
-      if (result.imported > 0) {
-        host.showToast('success', `Imported ${result.imported} sample(s)`);
-        // Refresh sample list if picker is open
-        if (pickerOpen) {
-          const refreshed: PluginSampleInfo[] = await host.getSamples();
-          setSamples(refreshed);
+      // Import the given files WITHOUT placing them; record what landed.
+      const importOnly = async (paths: string[], reason: LeftReason, detail?: string | null): Promise<void> => {
+        if (paths.length === 0) return;
+        outcome.leftReason = reason;
+        if (detail !== undefined) outcome.leftDetail = detail;
+        try {
+          const result = await host.importSamples(paths);
+          if (result.samples !== undefined) {
+            noteImported(result.samples.map((s) => s.id));
+            const resolved = new Set(result.samples.map((s) => s.sourcePath));
+            for (const s of result.samples) {
+              outcome.left.push({ name: fileBaseName(s.sourcePath), duplicate: s.duplicate });
+            }
+            const unresolved = paths.filter((p: string) => !resolved.has(p));
+            for (const p of unresolved) {
+              outcome.failedImports.push({
+                name: fileBaseName(p),
+                error: importErrorFor(p, result.errors, unresolved.length === 1),
+              });
+            }
+          } else {
+            // Pre-3.18.0 host: counts only, no per-file ids or names.
+            const single = paths.length === 1 ? fileBaseName(paths[0]) : null;
+            for (let i = 0; i < result.imported; i++) outcome.left.push({ name: single, duplicate: false });
+            const nFailed = Math.max(0, paths.length - result.imported);
+            for (let i = 0; i < nFailed; i++) {
+              outcome.failedImports.push({
+                name: single,
+                error: single ? importErrorFor(paths[0], result.errors, true) : null,
+              });
+            }
+          }
+        } catch (error: unknown) {
+          const msg = error instanceof Error ? error.message : 'Import failed';
+          for (const p of paths) outcome.failedImports.push({ name: fileBaseName(p), error: msg });
         }
-        // Any successful import means the library is no longer empty —
-        // hide the factory-download prompt.
-        setHasAnySamples(true);
-      }
-      if (result.errors.length > 0) {
-        host.showToast('warning', `${result.errors.length} import error(s)`, result.errors[0]);
-      }
-    } catch (error: unknown) {
-      const msg = error instanceof Error ? error.message : 'Import failed';
-      host.showToast('error', 'Import failed', msg);
-    }
-  }, [host, pickerOpen]);
+      };
 
-  // ─── Push header content (Add + Import buttons) to accordion header ─
+      // Blocked before anything is placed → import only (D-010: no scene =
+      // import + "Select a scene"; the other blockers follow the same rule).
+      const live = liveRef.current;
+      const blocker = placementBlocker({
+        activeSceneId: live.activeSceneId,
+        hasContract: !!live.sceneContext?.hasContract,
+        isConnected: live.isConnected,
+        trackCount: live.trackCount,
+      }, MAX_TRACKS);
+      if (blocker) {
+        await importOnly(filePaths, blocker);
+        setDiskLoad({ done: filePaths.length, total: filePaths.length });
+        if (blocker === 'no-scene') onSelectScene?.();
+        if (blocker === 'no-contract') onOpenContract?.();
+        return;
+      }
+
+      const sceneAtStart = live.activeSceneId;
+      const startCount = live.trackCount;
+      if (filePaths.length > 1) {
+        host.showToast(
+          'info',
+          `Adding ${filePaths.length} loops from disk…`,
+          'Each is fitted to the scene tempo and length: this can take a few seconds per loop.',
+        );
+      }
+      onExpandSelf?.();
+
+      for (let i = 0; i < filePaths.length; i++) {
+        const filePath = filePaths[i];
+        const name = fileBaseName(filePath);
+        setDiskLoad({ done: i, total: filePaths.length });
+
+        if (startCount + outcome.added.length >= MAX_TRACKS) {
+          await importOnly(filePaths.slice(i), 'track-limit');
+          break;
+        }
+        if (liveRef.current.activeSceneId !== sceneAtStart) {
+          await importOnly(filePaths.slice(i), 'scene-changed');
+          break;
+        }
+
+        // 1. Import this file.
+        let imported: { id: string; duplicate: boolean } | null = null;
+        try {
+          const result = await host.importSamples([filePath]);
+          if (result.samples === undefined) {
+            // Pre-3.18.0 host: the file is in (or failed) but there is no id
+            // to place. Account for it, import the rest, stop placing.
+            if (result.imported > 0) outcome.left.push({ name, duplicate: false });
+            else outcome.failedImports.push({ name, error: importErrorFor(filePath, result.errors, true) });
+            await importOnly(filePaths.slice(i + 1), 'old-host');
+            outcome.leftReason = 'old-host';
+            break;
+          }
+          const first = result.samples[0];
+          if (!first) {
+            outcome.failedImports.push({ name, error: importErrorFor(filePath, result.errors, true) });
+            continue;
+          }
+          imported = { id: first.id, duplicate: first.duplicate };
+          noteImported([first.id]);
+          setHasAnySamples(true);
+        } catch (error: unknown) {
+          const msg = error instanceof Error ? error.message : 'Import failed';
+          outcome.failedImports.push({ name, error: msg });
+          continue;
+        }
+        if (!imported) continue;
+
+        // 2. Fit + place it (the same path as the library picker).
+        try {
+          const source = await host.getSampleById(imported.id);
+          if (!source) throw new Error('It was imported but is missing from the library.');
+          await placeSample(source);
+          const loop = { name, duplicate: imported.duplicate, detail: describeSourceLoop(source) };
+          outcome.added.push(loop);
+          if (filePaths.length > 1) host.showToast('success', `Added ${name}`, perLoopMessage(loop));
+        } catch (error: unknown) {
+          const msg = error instanceof Error ? error.message : 'Unknown error';
+          if (isSceneWideError(error)) {
+            // Every later loop would fail the same way: keep this one in the
+            // library and import the rest, then say why.
+            outcome.left.push({ name, duplicate: imported.duplicate });
+            await importOnly(filePaths.slice(i + 1), 'host-error', msg);
+            outcome.leftReason = 'host-error';
+            outcome.leftDetail = msg;
+            break;
+          }
+          outcome.failedPlacements.push({ name, error: msg });
+        }
+      }
+      setDiskLoad({ done: filePaths.length, total: filePaths.length });
+    } catch (error: unknown) {
+      // The dialog itself failed (or an unexpected throw): say so.
+      const msg = error instanceof Error ? error.message : 'Unknown error';
+      if (outcome.picked === 0) {
+        host.showToast('error', 'Could not open the file picker', msg);
+      } else {
+        outcome.failedPlacements.push({ name: null, error: msg });
+      }
+    } finally {
+      diskLoadBusyRef.current = false;
+      setDiskLoad(null);
+      if (outcome.picked > 0) {
+        const toast = summarizeLoad(outcome, MAX_TRACKS);
+        host.showToast(toast.type, toast.title, toast.message);
+        if (outcome.added.length > 0 || outcome.left.length > 0) {
+          setHasAnySamples(true);
+          if (outcome.added.length === 0) {
+            // Nothing placed (no scene, no contract, track limit, an old host,
+            // a scene-wide stop…): open + Library on "Recently imported" with
+            // the just-imported rows lit, so placing them is one click. The
+            // toast above still says why. A host with no ids (pre-3.18.0)
+            // can't say which rows: a single file is found by name instead.
+            const byName = batchIds.length === 0 && outcome.picked === 1 ? outcome.left[0]?.name ?? null : null;
+            void openPicker({ highlight: batchIds, ...(byName ? { query: byName } : {}) });
+            onExpandSelf?.();
+          } else if (pickerOpenRef.current) {
+            // Keep an open library picker in step with the new rows.
+            host.getSamples().then(setSamples).catch(() => { /* best effort */ });
+          }
+        }
+      }
+    }
+  }, [host, placeSample, onExpandSelf, onSelectScene, onOpenContract, openPicker, rememberImports]);
+
+  // ─── Push header content (the three add flows) to accordion header ─
+  // "From scene" · "From disk" · "+ Library": each names its SOURCE so the
+  // three read as distinct flows (S-015). Test ids are unchanged.
   const needsContract = !sceneContext?.hasContract;
   useEffect(() => {
     if (!onHeaderContent) return;
     const disabled = needsContract || !isConnected || !activeSceneId || tracks.length >= MAX_TRACKS;
+    // Why loops can't be placed right now (tooltips say it before the click).
+    const blockedReason: string | null = !activeSceneId
+      ? 'no scene is selected'
+      : needsContract
+        ? 'this scene has no contract yet'
+        : !isConnected
+          ? 'systems are not connected'
+          : tracks.length >= MAX_TRACKS
+            ? `this scene is at the ${MAX_TRACKS}-track loop limit`
+            : null;
+    const diskBusy = diskLoad !== null;
+    const diskLabel = !diskBusy
+      ? 'From disk'
+      : diskLoad.total > 1
+        ? `Adding ${Math.min(diskLoad.done + 1, diskLoad.total)}/${diskLoad.total}…`
+        : 'Adding…';
     onHeaderContent(
       <div className="flex gap-1 items-center">
         {(!canCrossfade || !designerView) && host.listImportableTracks && (
@@ -534,13 +810,18 @@ export function LoopsPanel({
               setImportOpen(true);
             }}
             disabled={!activeSceneId || needsContract}
+            title={!activeSceneId
+              ? 'Copy loops from another scene: select a scene first'
+              : needsContract
+                ? 'Copy loops from another scene: generate a contract for this scene first'
+                : 'Copy loops from another scene into this scene'}
             className={`px-2 py-0.5 text-[10px] font-medium rounded-sm border transition-colors ${
               !activeSceneId || needsContract
                 ? 'bg-sas-panel border-sas-border text-sas-muted/50 cursor-not-allowed'
                 : 'bg-sas-panel-alt border-sas-border text-sas-muted hover:border-sas-accent hover:text-sas-accent'
             }`}
           >
-            Import
+            From scene
           </button>
         )}
         {(!canCrossfade || !designerView) && (
@@ -548,16 +829,24 @@ export function LoopsPanel({
             data-testid="import-sample-button"
             onClick={(e: React.MouseEvent) => {
               e.stopPropagation();
-              if (needsContract) { onOpenContract?.(); return; }
-              handleImport();
+              void handleLoadFromDisk();
             }}
+            disabled={diskBusy}
+            aria-busy={diskBusy}
+            title={diskBusy
+              ? 'Adding loops from disk…'
+              : blockedReason
+                ? `Add loop files from disk to this scene (${blockedReason}: they will go to your library only)`
+                : 'Add loop files from disk to this scene'}
             className={`px-2 py-0.5 text-[10px] font-medium rounded-sm border transition-colors ${
-              needsContract || !isConnected
-                ? 'bg-sas-panel border-sas-border text-sas-muted/50 cursor-not-allowed'
-                : 'bg-sas-panel-alt border-sas-border text-sas-muted hover:border-sas-accent hover:text-sas-accent'
+              diskBusy
+                ? 'bg-sas-accent/10 border-sas-accent/40 text-sas-accent cursor-wait'
+                : blockedReason
+                  ? 'bg-sas-panel border-sas-border text-sas-muted/50 hover:text-sas-muted'
+                  : 'bg-sas-panel-alt border-sas-border text-sas-muted hover:border-sas-accent hover:text-sas-accent'
             }`}
           >
-            Load
+            {diskLabel}
           </button>
         )}
         {(!canCrossfade || !designerView) && (
@@ -565,14 +854,28 @@ export function LoopsPanel({
             data-testid="add-sample-button"
             onClick={(e: React.MouseEvent) => {
               e.stopPropagation();
-              if (needsContract) { onOpenContract?.(); return; }
+              // An open picker always closes (it can be open with no scene
+              // after "From disk" left loops in the library).
               if (pickerOpen) {
                 closePicker();
-              } else {
-                openPicker();
-                onExpandSelf?.();
+                return;
               }
+              if (!activeSceneId) {
+                host.showToast('warning', 'Select a scene', 'Loops are added to the selected scene.');
+                onSelectScene?.();
+                return;
+              }
+              if (needsContract) {
+                host.showToast('info', 'Generate a contract first', 'This scene needs a contract before loops can be added.');
+                onOpenContract?.();
+                return;
+              }
+              void openPicker();
+              onExpandSelf?.();
             }}
+            title={pickerOpen
+              ? 'Close the loop library'
+              : `Browse your loop library and add a loop to this scene${blockedReason ? ` (${blockedReason})` : ''}`}
             className={`px-2 py-0.5 text-[10px] font-medium rounded-sm border transition-colors ${
               disabled
                 ? 'bg-sas-panel border-sas-border text-sas-muted/50 cursor-not-allowed'
@@ -581,7 +884,7 @@ export function LoopsPanel({
                   : 'bg-sas-accent/10 border-sas-accent/30 text-sas-accent hover:bg-sas-accent/20'
             }`}
           >
-            {pickerOpen ? 'Close' : '+ Add'}
+            {pickerOpen ? 'Close' : LIBRARY_BUTTON_LABEL}
           </button>
         )}
         {canCrossfade && (
@@ -615,7 +918,7 @@ export function LoopsPanel({
       </div>
     );
     return () => { onHeaderContent(null); };
-  }, [onHeaderContent, isConnected, activeSceneId, tracks.length, pickerOpen, openPicker, closePicker, handleImport, needsContract, onOpenContract, host, designerView, canCrossfade, transitionDone, transitionSourceTotal, onExpandSelf]);
+  }, [onHeaderContent, isConnected, activeSceneId, tracks.length, pickerOpen, openPicker, closePicker, handleLoadFromDisk, diskLoad, needsContract, onOpenContract, onSelectScene, host, designerView, canCrossfade, transitionDone, transitionSourceTotal, onExpandSelf]);
 
   // ─── Push loading state to accordion header ────────────────────────
   useEffect(() => {
@@ -951,11 +1254,24 @@ export function LoopsPanel({
   const BPM_TOLERANCE = 2;
   const projectBpm = sceneContext?.bpm ?? null;
 
-  const searchFiltered: PluginSampleInfo[] = searchQuery.trim()
+  // "Recently imported" tops the list while the search box is empty. Typing
+  // folds those rows back into the normal results (the section hides; nothing
+  // is listed twice), and session imports keep their "new" badge there.
+  const recentImports: RecentImport[] = useMemo(
+    () => selectRecentlyImported(samples, sessionImports, Date.now()),
+    [samples, sessionImports],
+  );
+  const isSearching = searchQuery.trim().length > 0;
+  const showRecent = !isSearching && recentImports.length > 0;
+  const recentIds: ReadonlySet<string> = showRecent
+    ? new Set(recentImports.map((r: RecentImport) => r.sample.id))
+    : new Set();
+
+  const searchFiltered: PluginSampleInfo[] = isSearching
     ? samples.filter((s: PluginSampleInfo) =>
         s.filename.toLowerCase().includes(searchQuery.toLowerCase())
       )
-    : samples;
+    : samples.filter((s: PluginSampleInfo) => !recentIds.has(s.id));
 
   const bpmDistance = (s: PluginSampleInfo): number =>
     s.bpm == null || projectBpm == null ? Number.POSITIVE_INFINITY : Math.abs(s.bpm - projectBpm);
@@ -978,12 +1294,250 @@ export function LoopsPanel({
         .sort((a: PluginSampleInfo, b: PluginSampleInfo) => bpmDistance(a) - bpmDistance(b))
     : [];
 
+  // ─── Library picker (JSX) ───────────────────────────────────────
+  const renderPreviewButton = (sample: PluginSampleInfo): React.ReactElement => {
+    const isPreviewing = previewingSampleId === sample.id;
+    return (
+      <button
+        data-testid="sample-preview-button"
+        type="button"
+        aria-label={isPreviewing ? 'Stop preview' : 'Preview sample'}
+        onClick={(e: React.MouseEvent) => {
+          e.stopPropagation();
+          handlePreviewClick(sample);
+        }}
+        className={`flex-shrink-0 w-5 h-5 flex items-center justify-center rounded-sm border text-[10px] transition-colors ${
+          isPreviewing
+            ? 'bg-sas-accent border-sas-accent text-sas-bg'
+            : 'bg-sas-panel-alt border-sas-border text-sas-accent hover:border-sas-accent'
+        }`}
+      >
+        {isPreviewing ? '■' : '▶'}
+      </button>
+    );
+  };
+
+  // "new" = imported by "From disk" in this panel session.
+  const renderNewBadge = (sampleId: string): React.ReactNode => (sessionImports.has(sampleId) ? (
+    <span
+      data-testid="sample-new-badge"
+      title="Imported in this session"
+      className="text-[9px] leading-none px-1 py-0.5 rounded-sm bg-sas-accent text-sas-bg uppercase font-semibold flex-shrink-0"
+    >
+      new
+    </span>
+  ) : null);
+
+  // Brief ring on the rows "From disk" just imported but could not place.
+  const highlightClass = (sampleId: string): string =>
+    (highlightIds.has(sampleId) ? ' ring-1 ring-sas-accent bg-sas-accent/15' : '');
+
+  const renderRecentRow = (item: RecentImport): React.ReactElement => {
+    const { sample } = item;
+    const isStretching = stretchingIds.has(sample.id);
+    const highlighted = highlightIds.has(sample.id);
+    const offTempo = projectBpm != null && sample.bpm != null && Math.abs(sample.bpm - projectBpm) > BPM_TOLERANCE;
+    return (
+      <div
+        key={sample.id}
+        data-testid="recent-import-item"
+        data-sample-id={sample.id}
+        data-highlighted={highlighted ? 'true' : undefined}
+        title={importedTitle(item.at)}
+        className={`w-full px-2 py-1 rounded-sm text-xs flex items-center gap-2 transition-colors ${
+          isStretching ? 'cursor-wait opacity-60' : 'hover:bg-sas-panel-alt'
+        }${highlightClass(sample.id)}`}
+      >
+        {renderPreviewButton(sample)}
+        <button
+          type="button"
+          data-testid="recent-import-add"
+          onClick={() => handleAddSample(sample)}
+          disabled={isStretching}
+          className="flex-1 min-w-0 text-left flex items-center gap-2"
+        >
+          <GiSoundWaves size={14} className="text-sas-accent flex-shrink-0" />
+          <div className="flex-1 min-w-0">
+            <div className="flex items-center gap-1 min-w-0">
+              <span className="truncate text-sas-text">{sample.filename}</span>
+              {item.isNew && renderNewBadge(sample.id)}
+            </div>
+            <div className="flex gap-1 text-[10px] text-sas-muted/60">
+              {sample.bpm != null && <span>{sample.bpm} BPM</span>}
+              {sample.keyTonic != null && (
+                <span>{sample.keyTonic}{sample.keyMode ? ` ${sample.keyMode}` : ''}</span>
+              )}
+            </div>
+          </div>
+          {sample.category && (
+            <span className="text-[10px] px-1 py-0.5 rounded bg-sas-accent/10 text-sas-accent flex-shrink-0">
+              {sample.category}
+            </span>
+          )}
+          {(isStretching || offTempo) && (
+            <span className="text-[10px] text-sas-accent flex-shrink-0">
+              {isStretching ? 'Stretching...' : `→ ${projectBpm}`}
+            </span>
+          )}
+        </button>
+      </div>
+    );
+  };
+
+  const pickerEl: React.ReactElement = (
+    <div
+      data-testid="sample-picker"
+      className="border border-sas-border bg-sas-bg rounded-sm p-2 space-y-1"
+    >
+      <input
+        type="text"
+        data-testid="sample-search-input"
+        value={searchQuery}
+        onChange={(e: React.ChangeEvent<HTMLInputElement>) => setSearchQuery(e.target.value)}
+        placeholder="Search samples..."
+        className="sas-input w-full px-2 py-1 text-xs"
+      />
+      <div className="max-h-[240px] overflow-y-auto space-y-0.5">
+        {isLoadingSamples ? (
+          <div className="text-sas-muted text-xs text-center py-4">Loading samples...</div>
+        ) : matchedSamples.length === 0 && otherSamples.length === 0 && !showRecent ? (
+          <div className="text-sas-muted text-xs text-center py-4">
+            {searchQuery.trim()
+              ? 'No matching samples'
+              : 'Your library is empty: download the sample library, or add loop files with From disk.'}
+          </div>
+        ) : (
+          <>
+            {/* Recently imported (S-015 / D-011): only when something qualifies */}
+            {showRecent && (
+              <div data-testid="recently-imported-section">
+                <div className="text-[10px] text-sas-accent uppercase tracking-wide px-2 pt-1 pb-0.5 font-medium">
+                  Recently imported
+                </div>
+                {recentImports.map(renderRecentRow)}
+              </div>
+            )}
+
+            {/* BPM-matched section */}
+            {matchedSamples.length > 0 && (
+              <>
+                {(projectBpm != null || showRecent) && (
+                  <div className={`text-[10px] text-sas-accent uppercase tracking-wide px-2 pb-0.5 font-medium ${
+                    showRecent ? 'pt-2 border-t border-sas-border mt-1' : 'pt-1'
+                  }`}>
+                    {projectBpm != null ? `Matching ${projectBpm} BPM` : 'Library'}
+                  </div>
+                )}
+                {matchedSamples.map((sample: PluginSampleInfo) => {
+                  return (
+                    <div
+                      key={sample.id}
+                      data-testid="sample-picker-item"
+                      className={`w-full px-2 py-1 rounded-sm text-xs hover:bg-sas-panel-alt transition-colors flex items-center gap-2${highlightClass(sample.id)}`}
+                    >
+                      {renderPreviewButton(sample)}
+                      <button
+                        type="button"
+                        onClick={() => handleAddSample(sample)}
+                        className="flex-1 min-w-0 text-left flex items-center gap-2"
+                      >
+                        <GiSoundWaves size={14} className="text-sas-accent flex-shrink-0" />
+                        <div className="flex-1 min-w-0">
+                          <div className="flex items-center gap-1 min-w-0">
+                            <span className="truncate text-sas-text">{sample.filename}</span>
+                            {renderNewBadge(sample.id)}
+                          </div>
+                          <div className="flex gap-1 text-[10px] text-sas-muted/60">
+                            {sample.bpm != null && <span>{sample.bpm} BPM</span>}
+                            {sample.keyTonic != null && (
+                              <span>{sample.keyTonic}{sample.keyMode ? ` ${sample.keyMode}` : ''}</span>
+                            )}
+                          </div>
+                        </div>
+                        {sample.category && (
+                          <span className="text-[10px] px-1 py-0.5 rounded bg-sas-accent/10 text-sas-accent flex-shrink-0">
+                            {sample.category}
+                          </span>
+                        )}
+                      </button>
+                    </div>
+                  );
+                })}
+              </>
+            )}
+
+            {/* Other BPM section */}
+            {otherSamples.length > 0 && (
+              <>
+                <div className="text-[10px] text-sas-muted/60 uppercase tracking-wide px-2 pt-2 pb-0.5 font-medium border-t border-sas-border mt-1">
+                  Other BPM — will auto-stretch to {projectBpm}
+                </div>
+                {otherSamples.map((sample: PluginSampleInfo) => {
+                  const isStretching = stretchingIds.has(sample.id);
+                  return (
+                    <div
+                      key={sample.id}
+                      data-testid="sample-picker-item-other"
+                      className={`w-full px-2 py-1 rounded-sm text-xs flex items-center gap-2 transition-colors ${
+                        isStretching ? 'cursor-wait opacity-60' : 'hover:bg-sas-panel-alt'
+                      }${highlightClass(sample.id)}`}
+                    >
+                      {renderPreviewButton(sample)}
+                      <button
+                        type="button"
+                        onClick={() => handleAddSample(sample)}
+                        disabled={isStretching}
+                        className="flex-1 min-w-0 text-left flex items-center gap-2"
+                      >
+                        <GiSoundWaves size={14} className="text-sas-muted/40 flex-shrink-0" />
+                        <div className="flex-1 min-w-0">
+                          <div className="flex items-center gap-1 min-w-0">
+                            <span className="truncate text-sas-muted">{sample.filename}</span>
+                            {renderNewBadge(sample.id)}
+                          </div>
+                          <div className="flex gap-1 text-[10px] text-sas-muted/40">
+                            {sample.bpm != null && <span>{sample.bpm} BPM</span>}
+                            {sample.keyTonic != null && (
+                              <span>{sample.keyTonic}{sample.keyMode ? ` ${sample.keyMode}` : ''}</span>
+                            )}
+                          </div>
+                        </div>
+                        {sample.category && (
+                          <span className="text-[10px] px-1 py-0.5 rounded bg-sas-panel text-sas-muted/40 flex-shrink-0">
+                            {sample.category}
+                          </span>
+                        )}
+                        <span className="text-[10px] text-sas-accent flex-shrink-0">
+                          {isStretching ? 'Stretching...' : `→ ${projectBpm}`}
+                        </span>
+                      </button>
+                    </div>
+                  );
+                })}
+              </>
+            )}
+          </>
+        )}
+      </div>
+    </div>
+  );
+
   // ─── Render ──────────────────────────────────────────────────────
+
+  // No scene / no contract: the placeholder, plus the library picker when it
+  // is open ("From disk" opens it on the loops it could not place, so they
+  // wait at the top of Recently imported until the scene is ready).
+  const withPicker = (placeholder: React.ReactElement): React.ReactElement => (pickerOpen ? (
+    <div className="p-2 space-y-2">
+      {placeholder}
+      {pickerEl}
+    </div>
+  ) : placeholder);
 
   // No scene selected
   if (!activeSceneId) {
-    return (
-      <div data-testid="no-scene-placeholder-sample" className="flex items-center justify-center py-8">
+    return withPicker(
+      <div data-testid="no-scene-placeholder-sample" className={`flex items-center justify-center ${pickerOpen ? 'py-2' : 'py-8'}`}>
         <button
           onClick={() => onSelectScene?.()}
           className="text-sas-muted text-xs hover:text-sas-accent transition-colors underline underline-offset-2"
@@ -996,8 +1550,8 @@ export function LoopsPanel({
 
   // Scene selected but no contract generated yet
   if (!sceneContext?.hasContract) {
-    return (
-      <div data-testid="no-contract-placeholder-sample" className="flex items-center justify-center py-8">
+    return withPicker(
+      <div data-testid="no-contract-placeholder-sample" className={`flex items-center justify-center ${pickerOpen ? 'py-2' : 'py-8'}`}>
         <button
           onClick={() => onOpenContract?.()}
           className="text-sas-muted text-xs hover:text-sas-accent transition-colors underline underline-offset-2"
@@ -1070,156 +1624,8 @@ export function LoopsPanel({
         </div>
       )}
 
-      {/* Inline sample picker */}
-      {pickerOpen && (
-        <div
-          data-testid="sample-picker"
-          className="border border-sas-border bg-sas-bg rounded-sm p-2 space-y-1"
-        >
-          <input
-            type="text"
-            data-testid="sample-search-input"
-            value={searchQuery}
-            onChange={(e: React.ChangeEvent<HTMLInputElement>) => setSearchQuery(e.target.value)}
-            placeholder="Search samples..."
-            className="sas-input w-full px-2 py-1 text-xs"
-          />
-          <div className="max-h-[240px] overflow-y-auto space-y-0.5">
-            {isLoadingSamples ? (
-              <div className="text-sas-muted text-xs text-center py-4">Loading samples...</div>
-            ) : matchedSamples.length === 0 && otherSamples.length === 0 ? (
-              <div className="text-sas-muted text-xs text-center py-4">
-                {searchQuery.trim() ? 'No matching samples' : 'No samples available'}
-              </div>
-            ) : (
-              <>
-                {/* BPM-matched section */}
-                {matchedSamples.length > 0 && (
-                  <>
-                    {projectBpm != null && (
-                      <div className="text-[10px] text-sas-accent uppercase tracking-wide px-2 pt-1 pb-0.5 font-medium">
-                        Matching {projectBpm} BPM
-                      </div>
-                    )}
-                    {matchedSamples.map((sample: PluginSampleInfo) => {
-                      const isPreviewing = previewingSampleId === sample.id;
-                      return (
-                        <div
-                          key={sample.id}
-                          data-testid="sample-picker-item"
-                          className="w-full px-2 py-1 rounded-sm text-xs hover:bg-sas-panel-alt transition-colors flex items-center gap-2"
-                        >
-                          <button
-                            data-testid="sample-preview-button"
-                            type="button"
-                            aria-label={isPreviewing ? 'Stop preview' : 'Preview sample'}
-                            onClick={(e: React.MouseEvent) => {
-                              e.stopPropagation();
-                              handlePreviewClick(sample);
-                            }}
-                            className={`flex-shrink-0 w-5 h-5 flex items-center justify-center rounded-sm border text-[10px] transition-colors ${
-                              isPreviewing
-                                ? 'bg-sas-accent border-sas-accent text-sas-bg'
-                                : 'bg-sas-panel-alt border-sas-border text-sas-accent hover:border-sas-accent'
-                            }`}
-                          >
-                            {isPreviewing ? '■' : '▶'}
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => handleAddSample(sample)}
-                            className="flex-1 min-w-0 text-left flex items-center gap-2"
-                          >
-                            <GiSoundWaves size={14} className="text-sas-accent flex-shrink-0" />
-                            <div className="flex-1 min-w-0">
-                              <div className="truncate text-sas-text">{sample.filename}</div>
-                              <div className="flex gap-1 text-[10px] text-sas-muted/60">
-                                {sample.bpm != null && <span>{sample.bpm} BPM</span>}
-                                {sample.keyTonic != null && (
-                                  <span>{sample.keyTonic}{sample.keyMode ? ` ${sample.keyMode}` : ''}</span>
-                                )}
-                              </div>
-                            </div>
-                            {sample.category && (
-                              <span className="text-[10px] px-1 py-0.5 rounded bg-sas-accent/10 text-sas-accent flex-shrink-0">
-                                {sample.category}
-                              </span>
-                            )}
-                          </button>
-                        </div>
-                      );
-                    })}
-                  </>
-                )}
-
-                {/* Other BPM section */}
-                {otherSamples.length > 0 && (
-                  <>
-                    <div className="text-[10px] text-sas-muted/60 uppercase tracking-wide px-2 pt-2 pb-0.5 font-medium border-t border-sas-border mt-1">
-                      Other BPM — will auto-stretch to {projectBpm}
-                    </div>
-                    {otherSamples.map((sample: PluginSampleInfo) => {
-                      const isStretching = stretchingIds.has(sample.id);
-                      const isPreviewing = previewingSampleId === sample.id;
-                      return (
-                        <div
-                          key={sample.id}
-                          data-testid="sample-picker-item-other"
-                          className={`w-full px-2 py-1 rounded-sm text-xs flex items-center gap-2 transition-colors ${
-                            isStretching ? 'cursor-wait opacity-60' : 'hover:bg-sas-panel-alt'
-                          }`}
-                        >
-                          <button
-                            data-testid="sample-preview-button"
-                            type="button"
-                            aria-label={isPreviewing ? 'Stop preview' : 'Preview sample'}
-                            onClick={(e: React.MouseEvent) => {
-                              e.stopPropagation();
-                              handlePreviewClick(sample);
-                            }}
-                            className={`flex-shrink-0 w-5 h-5 flex items-center justify-center rounded-sm border text-[10px] transition-colors ${
-                              isPreviewing
-                                ? 'bg-sas-accent border-sas-accent text-sas-bg'
-                                : 'bg-sas-panel-alt border-sas-border text-sas-accent hover:border-sas-accent'
-                            }`}
-                          >
-                            {isPreviewing ? '■' : '▶'}
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => handleAddSample(sample)}
-                            disabled={isStretching}
-                            className="flex-1 min-w-0 text-left flex items-center gap-2"
-                          >
-                            <GiSoundWaves size={14} className="text-sas-muted/40 flex-shrink-0" />
-                            <div className="flex-1 min-w-0">
-                              <div className="truncate text-sas-muted">{sample.filename}</div>
-                              <div className="flex gap-1 text-[10px] text-sas-muted/40">
-                                {sample.bpm != null && <span>{sample.bpm} BPM</span>}
-                                {sample.keyTonic != null && (
-                                  <span>{sample.keyTonic}{sample.keyMode ? ` ${sample.keyMode}` : ''}</span>
-                                )}
-                              </div>
-                            </div>
-                            {sample.category && (
-                              <span className="text-[10px] px-1 py-0.5 rounded bg-sas-panel text-sas-muted/40 flex-shrink-0">
-                                {sample.category}
-                              </span>
-                            )}
-                            <span className="text-[10px] text-sas-accent flex-shrink-0">
-                              {isStretching ? 'Stretching...' : `→ ${projectBpm}`}
-                            </span>
-                          </button>
-                        </div>
-                      );
-                    })}
-                  </>
-                )}
-              </>
-            )}
-          </div>
-        </div>
-      )}
+      {/* Inline sample picker (built above: also shown by the no-scene / no-contract placeholders) */}
+      {pickerOpen && pickerEl}
 
       {/* Transition Designer — stays mounted so in-flight creates survive a toggle */}
       {canCrossfade && xfFromId && xfToId && (
