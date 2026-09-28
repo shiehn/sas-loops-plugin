@@ -28,6 +28,10 @@ jest.mock('@signalsandsorcery/plugin-sdk', () => ({
   parseFades: () => [],
   buildCrossfadeVolumeCurves: () => ({ origin: [], target: [] }),
   buildFadeVolumeCurve: () => [],
+  // S-027 scene bus strip: this suite runs as a host without the bus surface
+  // (no strip, no bus reads); LoopsPanel.panelBus.test.tsx covers the strip.
+  usePanelBus: () => ({ supported: false, bus: null }),
+  PanelMasterStrip: () => null,
 }));
 
 jest.mock('react-icons/gi', () => ({

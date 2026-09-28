@@ -23,6 +23,13 @@
  * (rules in recently-imported.ts). When "From disk" places nothing (no scene,
  * no contract, track limit, an old host, a scene-wide stop) the picker opens
  * on it with the just-imported rows highlighted, so the pick is one click away.
+ *
+ * Scene panel bus (S-027 / D-018, D-020): the SDK's PanelMasterStrip tops the
+ * track list, like the drum panel and every GeneratorPanelShell panel. One
+ * fader + FX chain for all of the scene's loops, plus the Duck / WOB clusters
+ * (loops are duck and wobble TARGETS; both start at amount 0 = off, never a
+ * duck source). The host routes the loops into the bus on each bus read, so
+ * the panel re-reads whenever its loop set changes (notifyTracksChanged).
  */
 
 import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react';
@@ -34,7 +41,7 @@ import type {
   PluginTrackHandle,
   PluginTrackRuntimeState,
 } from '@signalsandsorcery/plugin-sdk';
-import { TrackRow, type DrawerTab, useAnySolo, ImportTrackModal, useTrackLevels, TransitionDesigner, CrossfadeTrackRow, FadeTrackRow, parseCrossfadePairs, parseFades, buildCrossfadeVolumeCurves, buildFadeVolumeCurve, type CrossfadeSlot, type CrossfadeSelection, type CrossfadeMeta, type CrossfadePairMeta, type FadeDirection, type FadeGesture, type FadeMeta, type FadeEntry, type FadeSelection } from '@signalsandsorcery/plugin-sdk';
+import { TrackRow, type DrawerTab, useAnySolo, PanelMasterStrip, usePanelBus, ImportTrackModal, useTrackLevels, TransitionDesigner, CrossfadeTrackRow, FadeTrackRow, parseCrossfadePairs, parseFades, buildCrossfadeVolumeCurves, buildFadeVolumeCurve, type CrossfadeSlot, type CrossfadeSelection, type CrossfadeMeta, type CrossfadePairMeta, type FadeDirection, type FadeGesture, type FadeMeta, type FadeEntry, type FadeSelection } from '@signalsandsorcery/plugin-sdk';
 import {
   LIBRARY_BUTTON_LABEL,
   describeSourceLoop,
@@ -123,6 +130,22 @@ export function LoopsPanel({
   const [tracks, setTracks] = useState<SampleTrackState[]>([]);
   // Cross-panel: dim non-soloed rows when ANY track (any panel) is soloed.
   const anySolo = useAnySolo(host);
+
+  // ─── Scene panel bus (S-027 / D-018, D-020) ──────────────────────
+  // Same hook as the drum panel / GeneratorPanelShell. Feature-gated: on a
+  // host without the bus surface `supported` is false and no strip renders.
+  // A bus read is where the host routes this panel's loops into the bus and,
+  // in the active scene, auto-engages it once a loop exists.
+  const panelBus = usePanelBus(host, activeSceneId);
+  // "The loop set changed": re-read the bus so a new loop joins it at once
+  // (S-027 gap G1). Coalesced, never overlapping, stable identity (safe in
+  // deps). Not `panelBus.reload()`: that reads immediately and can overlap.
+  // It is SDK 3.19.0 and the host supplies the SDK at runtime, so an older
+  // one has none: loops then join the bus on the next scene change or reopen,
+  // as before. That is why minHostVersion does not move.
+  const notifyBusTracksChanged: (() => void) | undefined =
+    typeof panelBus.notifyTracksChanged === 'function' ? panelBus.notifyTracksChanged : undefined;
+
   const [isLoadingTracks, setIsLoadingTracks] = useState(false);
   const [pickerOpen, setPickerOpen] = useState(false);
   const [importOpen, setImportOpen] = useState(false);
@@ -321,6 +344,12 @@ export function LoopsPanel({
       }
       if (isStale()) return;
       setTracks(trackStates);
+      // The loop set is settled for this scene: let the bus route it (and
+      // auto-engage on the scene's first loop). This covers every reload:
+      // scene change, engine ready, agent mutations, "From scene" imports,
+      // crossfade / fade / audio-transition creates. A stale load never gets
+      // here, so it never reads the bus for a scene that is gone.
+      notifyBusTracksChanged?.();
       // Parse committed crossfade/fade metadata for the Transition Designer.
       if (host.getAllSceneData) {
         try {
@@ -340,7 +369,7 @@ export function LoopsPanel({
         setIsLoadingTracks(false);
       }
     }
-  }, [host, activeSceneId]);
+  }, [host, activeSceneId, notifyBusTracksChanged]);
 
   useEffect(() => {
     loadTracks();
@@ -547,8 +576,11 @@ export function LoopsPanel({
       drawerTab: 'fx',
     };
     setTracks((prev: SampleTrackState[]) => [...prev, newTrack]);
+    // A placed loop joins the scene bus now, not on the next reload (the
+    // library picker and every "From disk" loop both land here).
+    notifyBusTracksChanged?.();
     return { handle, placed: sampleToLoad, fitted: needsFit };
-  }, [host]);
+  }, [host, notifyBusTracksChanged]);
 
   // ─── Add sample track from the library picker ───────────────────
   const handleAddSample = useCallback(async (sample: PluginSampleInfo): Promise<void> => {
@@ -1650,6 +1682,46 @@ export function LoopsPanel({
         <div className="text-sas-muted text-xs text-center py-4">Loading tracks...</div>
       ) : (
         <>
+          {/* Scene panel bus strip (S-027): the drum panel / shell placement.
+              Hidden while loading, in the designer view and under the
+              placeholders; absent on hosts without the bus surface. */}
+          {panelBus.supported && panelBus.bus && (
+            // The ref gates the bus meter stream to on-screen strips (a
+            // collapsed or scrolled-away panel holds no engine refcount).
+            <div ref={panelBus.meterVisibilityRef}>
+              <PanelMasterStrip
+                bus={panelBus.bus}
+                levels={panelBus.levels}
+                availableFx={panelBus.availableFx}
+                fxLoading={panelBus.fxLoading}
+                soloedOut={anySolo && !panelBus.bus.soloed}
+                fxPickerOpen={panelBus.fxPickerOpen}
+                onToggleFxPicker={panelBus.setFxPickerOpen}
+                onRefreshFx={panelBus.refreshFx}
+                onVolumeChange={panelBus.onVolumeChange}
+                onMuteToggle={panelBus.onMuteToggle}
+                onSoloToggle={panelBus.onSoloToggle}
+                onAddFx={panelBus.onAddFx}
+                onRemoveFx={panelBus.onRemoveFx}
+                onToggleFxEnabled={panelBus.onToggleFxEnabled}
+                onShowFxEditor={panelBus.onShowFxEditor}
+                onMoveFx={panelBus.fxReorderSupported ? panelBus.onMoveFx : undefined}
+                // Duck + WOB (D-020): loops are targets. The host's default
+                // is amount 0 (off) until the user touches it; the panel
+                // never writes either on its own.
+                sidechain={panelBus.sidechainSupported ? panelBus.sidechain : null}
+                onSidechainAmountChange={panelBus.sidechainSupported ? panelBus.onSidechainAmountChange : undefined}
+                onSidechainPresetChange={panelBus.sidechainSupported ? panelBus.onSidechainPresetChange : undefined}
+                onSidechainSourceChange={panelBus.sidechainSupported ? panelBus.onSidechainSourceChange : undefined}
+                onSidechainLengthChange={panelBus.sidechainSupported ? panelBus.onSidechainLengthChange : undefined}
+                motion={panelBus.motionSupported ? panelBus.motion : null}
+                onMotionAmountChange={panelBus.motionSupported ? panelBus.onMotionAmountChange : undefined}
+                onMotionRateChange={panelBus.motionSupported ? panelBus.onMotionRateChange : undefined}
+                onMotionShapeChange={panelBus.motionSupported ? panelBus.onMotionShapeChange : undefined}
+                onMotionTargetChange={panelBus.motionSupported ? panelBus.onMotionTargetChange : undefined}
+              />
+            </div>
+          )}
           {resolvedCrossfadePairs.map((pair: ResolvedCrossfadePair) => (
             <CrossfadeTrackRow
               key={pair.groupId}

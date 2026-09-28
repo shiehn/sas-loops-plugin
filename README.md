@@ -15,6 +15,7 @@ A [Signals & Sorcery](https://signalsandsorcery.com) plugin for browsing, import
 - Create scene-scoped loop tracks
 - Time-stretch samples to match project BPM
 - Per-track volume, pan, mute, and solo controls
+- A scene mix bus for all of a scene's loops (like the drum panel): one fader, an FX chain (a compressor or any FX), and Duck / WOB, which start off
 
 ## Install
 
