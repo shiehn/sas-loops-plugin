@@ -1,6 +1,6 @@
 {
   "name": "@signalsandsorcery/loops",
-  "version": "2.2.0",
+  "version": "2.2.1",
   "description": "Audio loop / sample library browser with time-stretching and scene-scoped playback",
   "main": "./dist/index.js",
   "module": "./dist/index.mjs",

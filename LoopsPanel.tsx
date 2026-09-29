@@ -1790,7 +1790,7 @@ export function LoopsPanel({
           {tracks.filter((t: SampleTrackState) => !crossfadeMemberDbIds.has(t.handle.dbId) && !fadeMemberDbIds.has(t.handle.dbId)).map((track: SampleTrackState) => (
           <TrackRow
             key={track.handle.id}
-            track={{ id: track.handle.id, name: track.handle.name }}
+            track={{ id: track.handle.id, name: track.handle.name, dbId: track.handle.dbId }}
             levels={supportsMeters ? trackLevels : undefined}
             runtimeState={{
               muted: track.runtimeState.muted,
